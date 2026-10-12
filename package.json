@@ -1,0 +1,29 @@
+{
+  "name": "frutia",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generador de frutinovelas con IA para TikTok, Reels y Shorts",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev:api": "npm run dev --workspace=@frutia/api",
+    "dev:web": "npm run dev --workspace=@frutia/web",
+    "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "test": "npm run build --workspace=@frutia/core && node --test \"packages/core/test/*.test.js\"",
+    "test:api": "node scripts/test-api.mjs",
+    "test:web": "node scripts/smoke-web.mjs",
+    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit && tsc -p apps/api/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json",
+    "demo": "npm run build --workspace=@frutia/core && node scripts/demo-render.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}

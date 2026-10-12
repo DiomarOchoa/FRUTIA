@@ -1,0 +1,242 @@
+﻿/**
+ * Composicion de video con ffmpeg.
+ *
+ * Este es el corazon del modo $0. Sin modelos de video (que no tienen free
+ * tier), cada plano se convierte en un clip corto a partir de una imagen
+ * estatica usando movimiento de camara tipo Ken Burns, combinado con
+ * transiciones y el audio ya generado.
+ *
+ * Por que funciona: el algoritmo de TikTok no evalua "fotogramas de video
+ * reales", evalua retencion. Un encuadre que se mueve con intencion, mas voz
+ * dramatica y subtitulo palabra-a-palabra, retiene igual que cualquier otra
+ * cosa. El upgrade a video real entra despues por `VideoProvider` sin tocar
+ * este archivo.
+ */
+
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import type { Readable } from 'node:stream';
+import { mkdir } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+
+/**
+ * `ffmpeg-static` es un paquete CommonJS que exporta la ruta al binario. Bajo
+ * ESM la importacion por defecto no resuelve de forma fiable, asi que se carga
+ * con `createRequire`, que si lo hace y ademas evita el interop de `default`.
+ */
+const require = createRequire(import.meta.url);
+const ffmpegPath: string | null = require('ffmpeg-static');
+
+export const VIDEO_WIDTH = 1080;
+export const VIDEO_HEIGHT = 1920;
+export const FPS = 30;
+
+/** Formato de un plano ya renderizado a imagen + audio. */
+export interface Shot {
+  imagePath: string;
+  audioPath: string;
+  /** Duracion real del audio en segundos. Manda sobre cualquier estimacion. */
+  duration: number;
+}
+
+/**
+ * Como se mueve la camara en cada plano. Se elige en round-robin para que dos
+ * planos consecutivos no compartan movimiento: el ojo nota la repeticion antes
+ * de que el espectador decida si se queda.
+ */
+const CAMERA_MOVES = [
+  'in',      // zoom lento hacia adentro
+  'out',     // zoom lento hacia afuera
+  'left',    // paneo a la izquierda
+  'right',   // paneo a la derecha
+  'up',      // paneo hacia arriba
+  'down',    // paneo hacia abajo
+] as const;
+
+export type CameraMove = (typeof CAMERA_MOVES)[number];
+
+/**
+ * Genera el filtro `zoompan` de un plano.
+ *
+ * Trampa importante de `zoompan`: su parametro `d` son los fotogramas de SALIDA
+ * que produce CADA fotograma de entrada. Como aqui la entrada es una imagen en
+ * bucle, ya llegan `duration * FPS` fotogramas; poner `d` al numero total
+ * multiplica la duracion por si misma (75 x 75 = 5625 fotogramas, casi tres
+ * minutos para un plano de 2,5s). Por eso `d=1` y toda la animacion se deriva
+ * de `on`, el indice del fotograma de salida.
+ *
+ * El movimiento se expresa como funcion de `on / (frames - 1)`, que recorre de
+ * 0 a 1 durante el plano. La velocidad es entonces independiente de la
+ * duracion: un plano de 2s y uno de 12s hacen el mismo trayecto en su tiempo.
+ */
+function zoompanFilter(move: CameraMove, durationSec: number): string {
+  const frames = Math.max(2, Math.round(durationSec * FPS));
+  // `on` va de 0 a frames-1; el divisor evita division por cero.
+  const span = frames - 1;
+
+  const ZOOM_FROM = 1.05;
+  const ZOOM_TO = 1.28;
+  const delta = (ZOOM_TO - ZOOM_FROM).toFixed(4);
+
+  const zoomExpr =
+    move === 'in' ? `${ZOOM_FROM}+${delta}*on/${span}` :
+    move === 'out' ? `${ZOOM_TO}-${delta}*on/${span}` :
+    '1.18';
+
+  // El pan recorre el ancho (o alto) libre que deja el zoom, de un extremo al
+  // otro segun el sentido.
+  const xExpr =
+    move === 'right' ? `(iw-iw/zoom)*(1-on/${span})` :
+    move === 'left' ? `(iw-iw/zoom)*on/${span}` :
+    'iw/2-(iw/zoom/2)';
+
+  const yExpr =
+    move === 'down' ? `(ih-ih/zoom)*on/${span}` :
+    move === 'up' ? `(ih-ih/zoom)*(1-on/${span})` :
+    'ih/2-(ih/zoom/2)';
+
+  return (
+    `scale=${VIDEO_WIDTH * 2}:${VIDEO_HEIGHT * 2}:force_original_aspect_ratio=increase,` +
+    `crop=${VIDEO_WIDTH * 2}:${VIDEO_HEIGHT * 2},` +
+    `zoompan=z='${zoomExpr}':d=1:x='${xExpr}':y='${yExpr}':` +
+    `s=${VIDEO_WIDTH}x${VIDEO_HEIGHT}:fps=${FPS}`
+  );
+}
+
+/** Normaliza el tamano de la imagen antes de animarla. */
+function preScale(): string {
+  return (
+    `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=increase,` +
+    `crop=${VIDEO_WIDTH}:${VIDEO_HEIGHT}`
+  );
+}
+
+/**
+ * Convierte una lista de planos en un unico MP4 de 9:16.
+ *
+ * Cada plano se procesa como un input independiente y se concatena con el
+ * filtro `concat`. Cada plano lleva su audio, asi que el video ya sale con la
+ * pista de voz sincronizada toma a toma.
+ */
+export async function composeStory(
+  shots: Shot[],
+  subtitlePath: string | null,
+  outputPath: string,
+  workDir: string,
+): Promise<string> {
+  if (shots.length === 0) throw new Error('No hay planos que componer.');
+
+  const bin = ffmpegPath;
+  if (!bin) throw new Error('ffmpeg-static no resolvio el binario. Revisa la instalacion.');
+
+  await mkdir(workDir, { recursive: true });
+  await mkdir(path.dirname(outputPath), { recursive: true });
+
+  const args: string[] = ['-y'];
+
+  // Un input por plano: imagen en bucle + audio.
+  // `-framerate` fija la cadencia del bucle para que la imagen aporte
+  // exactamente `dur * FPS` fotogramas y el plano mida lo que dice el audio.
+  shots.forEach((shot) => {
+    args.push('-loop', '1', '-framerate', String(FPS), '-t', shot.duration.toFixed(3), '-i', shot.imagePath);
+    args.push('-i', shot.audioPath);
+  });
+
+  // Filtro de video por plano: pre-escalado + Ken Burns.
+  const videoChains: string[] = [];
+  const audioChains: string[] = [];
+  shots.forEach((_shot, i) => {
+    const imgIdx = i * 2;
+    const audIdx = i * 2 + 1;
+    const move = CAMERA_MOVES[i % CAMERA_MOVES.length]!;
+    const dur = shots[i]!.duration;
+
+    videoChains.push(
+      `[${imgIdx}:v]${preScale()},${zoompanFilter(move, dur)},setsar=1[v${i}]`,
+    );
+    audioChains.push(`[${audIdx}:a]aresample=48000,asetpts=N/SR/TB[a${i}]`);
+  });
+
+  // Concatena videos, concatena audios.
+  const vLabels = shots.map((_, i) => `[v${i}]`).join('');
+  const aLabels = shots.map((_, i) => `[a${i}]`).join('');
+  let filter = `${videoChains.join(';')};${audioChains.join(';')};` +
+    `${vLabels}concat=n=${shots.length}:v=1:a=0[vcat];` +
+    `${aLabels}concat=n=${shots.length}:v=0:a=1[acat]`;
+
+  // Quema los subtitulos quemandolos sobre el video concatenado.
+  if (subtitlePath) {
+    const subPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
+    filter += `;[vcat]ass='${subPath}'[vout];`;
+  } else {
+    filter += `;[vcat]null[vout];`;
+  }
+
+  args.push('-filter_complex', filter);
+  args.push('-map', '[vout]', '-map', '[acat]');
+  args.push(
+    '-c:v', 'libx264',
+    '-preset', 'medium',
+    '-crf', '20',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    '-movflags', '+faststart',
+    outputPath,
+  );
+
+  await runFfmpeg(bin, args);
+  return outputPath;
+}
+
+/** Ejecuta ffmpeg y propaga los errores con contexto util. */
+function runFfmpeg(bin: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // Tipamos `proc` explicitamente: la sobrecarga de `spawn` con stdio mixto
+    // colapsa a `never` bajo TypeScript 5 sin esta anotacion.
+    const proc: ChildProcessByStdio<null, null, Readable> = spawn(bin, args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+      // ffmpeg es muy verboso; solo guardamos el final, que es donde esta el error.
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg termino con codigo ${code}:\n${stderr.slice(-1500)}`));
+    });
+  });
+}
+
+/** Duracion real de un archivo de audio, en segundos. La usa el pipeline. */
+export async function probeDuration(audioPath: string): Promise<number> {
+  const bin = ffmpegPath;
+  if (!bin) throw new Error('ffmpeg-static no resolvio el binario.');
+  return new Promise((resolve, reject) => {
+    // `ffprobe` no viene con ffmpeg-static: leemos la cabecera de duracion que
+    // ffmpeg escribe en stderr al recibir `-i` sin archivo de salida.
+    const proc: ChildProcessByStdio<null, null, Readable> = spawn(bin, ['-i', audioPath], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on('error', reject);
+    proc.on('close', () => {
+      const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
+      if (!match) return reject(new Error(`No se pudo leer la duracion de ${audioPath}`));
+      const [, h = '0', m = '0', s = '0'] = match;
+      resolve(Number(h) * 3600 + Number(m) * 60 + Number(s));
+    });
+  });
+}
+
+/** Convierte base64 (de la API) a archivo en disco. */
+export async function writeBase64File(base64: string, outPath: string): Promise<string> {
+  const { writeFile } = await import('node:fs/promises');
+  await mkdir(path.dirname(outPath), { recursive: true });
+  await writeFile(outPath, Buffer.from(base64, 'base64'));
+  return outPath;
+}

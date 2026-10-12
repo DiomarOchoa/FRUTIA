@@ -1,0 +1,25 @@
+{
+  "name": "@frutia/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node --env-file-if-exists=../../.env ../../node_modules/tsx/dist/cli.mjs watch src/server.ts",
+    "start": "node --env-file-if-exists=../../.env dist/server.js"
+  },
+  "dependencies": {
+    "@frutia/core": "*",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
