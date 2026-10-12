@@ -183,11 +183,11 @@ storage/<storyId>/
 | Etapa | Coste |
 |---|---|
 | Guion | Free tier de Gemini Flash |
-| Imágenes | Free tier de `gemini-2.5-flash-image` (~100–500/día) |
-| Voz | Free tier de `gemini-2.5-flash-preview-tts` (~100k caracteres/mes) |
+| Imágenes | Free tier de `gemini-3.1-flash-image` (~100–500/día) |
+| Voz | Free tier de `gemini-3.1-flash-tts-preview` (~100k caracteres/mes) |
 | Render | ffmpeg local, `$0` |
 
-El free tier es el techo de esta fase. En cuanto seANCES, el pipeline añade un
+El free tier es el techo de esta fase. En cuanto escales, el pipeline añade un
 proveedor de video real (Veo Lite a $0.05/s). Ver `PLAN.md` para los números de
 coste por video y el modelo de precios.
 

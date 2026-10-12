@@ -16,10 +16,10 @@
     "dev:api": "npm run dev --workspace=@frutia/api",
     "dev:web": "npm run dev --workspace=@frutia/web",
     "dev": "concurrently -n api,web -c cyan,magenta \"npm:dev:api\" \"npm:dev:web\"",
-    "test": "npm run build --workspace=@frutia/core && node --test \"packages/core/test/*.test.js\"",
+    "test": "npm run build --workspace=@frutia/core && npm run build --workspace=@frutia/api && node --test \"packages/core/test/*.test.js\"",
     "test:api": "node scripts/test-api.mjs",
     "test:web": "node scripts/smoke-web.mjs",
-    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit && tsc -p apps/api/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json",
+    "typecheck": "npm run build --workspace=@frutia/core && tsc -p packages/core/tsconfig.json --noEmit && tsc -p apps/api/tsconfig.json --noEmit && tsc -p apps/web/tsconfig.json",
     "demo": "npm run build --workspace=@frutia/core && node scripts/demo-render.mjs"
   },
   "devDependencies": {

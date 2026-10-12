@@ -42,7 +42,7 @@ export const ARCHETYPES: Record<Archetype, ArchetypeSpec> = {
   },
   naive: {
     visual: 'ojos muy abiertos, sonrisa ausente, expresión desprevenida',
-    personality: 'la confiada que no ve venir la catastrophe',
+    personality: 'la confiada que no ve venir la catástrofe',
     voiceTone: 'femenina-juvenil',
   },
   rival: {
@@ -178,9 +178,9 @@ REGLAS DE ESTRUCTURA
    Este es el calculo, respectalo al pie de la letra:
 
    - El hook dura 3-4 segundos de voz.
-   - Los demas planos necesitan UNas 9-10 palabras de narracion cada uno.
+   - Los demas planos necesitan unas 9-10 palabras de narracion cada uno.
      Con menos de 8 palabras, el plano se queda corto y el total no llega.
-   - Total objetivo: entre 70 y 80 segundos. Apunta ahi, no a 60justo.
+   - Total objetivo: entre 70 y 80 segundos. Apunta ahi, no a 60 justos.
 
    Un ejemplo con 8 planos: hook de 12 palabras + 7 planos de 20 palabras
    cada uno = unas 152 palabras en total. Si escribes menos, no llegas.
@@ -193,8 +193,8 @@ REGLAS DE ESTRUCTURA
    Narra poco por plano en cuanto a PAUSAS, no en cuanto a palabras: las
    comas y los puntos hacen que la voz sintetica suene natural.
 
-3. LENGUAJE. Español latinoamericano colloquial. Frases cortas. Nada de
-   lenguaje florido ni voz en off literary. El drama se cuenta con hechos
+3. LENGUAJE. Español latinoamericano coloquial. Frases cortas. Nada de
+   lenguaje florido ni voz en off literaria. El drama se cuenta con hechos
    concretos, no con adjetivos. Evita la voz en off literaria.
 
 4. DIALOGO. Cuando un personaje habla, escribe su nombre así:

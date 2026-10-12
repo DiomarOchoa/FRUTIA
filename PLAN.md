@@ -51,7 +51,7 @@ Costos reales de una frutinovela de 60s en el modo $0:
 
 El free tier de Google para imagenes (`gemini-*-image`) puede responder `429`
 con **cuota cero** aunque la clave sea válida, según el estado de la cuenta. Es
-lo que ocurrió al probar el proyecto, y contradice lo que se dokumenta como
+lo que ocurrió al probar el proyecto, y contradice lo que se documenta como
 "~500 imágenes/día".
 
 Por eso `ImageProvider` es ahora una **cascada**: intenta Google y, solo si el
@@ -170,7 +170,7 @@ viraliza, los usuarios ya vieron el resultado antes de pagar.
 - [ ] Proveedor de video real (Veo Lite) tras el toggle `videoProvider`
 - [ ] Móvil con Expo reutilizando la API (no el pipeline)
 - [ ] Multi-idioma (la demanda más fuerte está fuera de Latinoamérica)
-- [ ] Analytics de retención: qué planosFUNCTIONan y cuáles se descartan
+- [ ] Analytics de retención: qué planos funcionan y cuáles se descartan
 - [ ] Publicación asistida (guardar en borradores, nunca auto-publicar)
 
 ### Fase 5 — Opcional, si la API de TikTok se aprueba
@@ -187,7 +187,7 @@ viraliza, los usuarios ya vieron el resultado antes de pagar.
 | TikTok hunde el nicho frutinovelas | Alto | Formato ya visto en 4 plataformas; pivote a otro nicho narrativo |
 | Descalificación por "no original" | Alto | Curaduría obligatoria + etiquetado de IA visible |
 | Cuota del free tier insuficiente | Medio | Cola con concurrencia 2; avisar al usuario del límite |
-| Quality cae al archetypo "video con IA" | Medio | Planilla de ROI por variante antes de migrar |
+| Quality cae al arquetipo "video con IA" | Medio | Planilla de ROI por variante antes de migrar |
 | Coste por video supera el precio | Alto | Créditos prepagados con recargo; nunca planes ilimitados |
 
 ---

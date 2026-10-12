@@ -327,7 +327,7 @@ export async function composeFinal(
 
   for (const scene of active) {
     // Se compone la variante elegida, no la ultima generada: es el punto de
-    // regenerar "variantes" y descartar las que no serving.
+    // regenerar "variantes" y descartar las que no sirvieron.
     const imagePath = scene.variants[scene.activeVariant] ?? scene.variants[0];
     if (!imagePath || !scene.audioPath) continue;
     const durationMs = scene.targetDuration * 1000;
