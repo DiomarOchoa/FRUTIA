@@ -188,6 +188,12 @@ export class TtsProvider {
    * necesita saber que fallo de verdad, no un audio de otra cosa.
    */
   async speak(input: SpeakInput): Promise<SpokenAudio> {
+    if (process.env.FRUTIA_TTS_PROVIDER === 'piper') {
+      if (!this.piper.available) throw new Error('Piper fue seleccionado, pero no se encontro el modelo configurado.');
+      const audio = await this.piper.speak(input.text);
+      this.lastBackend = 'piper';
+      return normalizeAudio(audio.mimeType, audio.base64);
+    }
     const fallos: string[] = [];
 
     // 1. Google

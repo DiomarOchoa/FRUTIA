@@ -13,6 +13,9 @@ const BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 export interface LlmOptions {
   apiKey: string;
+  provider?: 'gemini' | 'ollama';
+  ollamaUrl?: string;
+  ollamaModel?: string;
   /** Sobrescribe la lista de candidatos. */
   models?: string[];
   timeoutMs?: number;
@@ -31,9 +34,15 @@ const DEFAULT_TIMEOUT_MS = 150_000;
 export class LlmProvider {
   private readonly models: string[];
   private readonly timeoutMs: number;
+  private readonly provider: 'gemini' | 'ollama';
+  private readonly ollamaUrl: string;
+  private readonly ollamaModel: string;
 
   constructor(private readonly opts: LlmOptions) {
-    if (!opts.apiKey) throw new Error('LLM: falta GEMINI_API_KEY.');
+    this.provider = opts.provider ?? 'gemini';
+    this.ollamaUrl = (opts.ollamaUrl ?? process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434').replace(/\/+$/, '');
+    this.ollamaModel = opts.ollamaModel ?? process.env.FRUTIA_OLLAMA_MODEL ?? 'qwen2.5:3b';
+    if (this.provider === 'gemini' && !opts.apiKey) throw new Error('LLM: falta GEMINI_API_KEY.');
     this.models = opts.models?.length
       ? opts.models
       : modelCandidates('FRUTIA_LLM_MODEL', [
@@ -41,7 +50,9 @@ export class LlmProvider {
           'gemini-3.7-flash',
           'gemini-3.5-flash',
         ]);
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.timeoutMs = opts.timeoutMs ?? (this.provider === 'ollama'
+      ? Number(process.env.FRUTIA_OLLAMA_TIMEOUT_MS ?? 900_000)
+      : DEFAULT_TIMEOUT_MS);
   }
 
   /**
@@ -49,9 +60,29 @@ export class LlmProvider {
    * Devuelve el contenido crudo, sin interpretar: el parseo vive en prompts.ts.
    */
   async complete(system: string, user: string): Promise<string> {
+    if (this.provider === 'ollama') return this.callOllama(system, user);
     return withModelFallback(this.models, (model) => this.call(model, system, user));
   }
 
+  private async callOllama(system: string, user: string): Promise<string> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await fetch(this.ollamaUrl + '/api/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({ model: this.ollamaModel, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], format: 'json', stream: false, options: { temperature: 0.8, num_ctx: 8192, num_predict: 2048 } }),
+      });
+      if (!res.ok) throw new Error('Ollama ' + res.status + ': ' + (await res.text().catch(() => '')).slice(0, 300));
+      const json = await res.json() as { message?: { content?: string } };
+      const answer = json.message?.content?.trim();
+      if (!answer) throw new Error('Ollama devolvio una respuesta vacia.');
+      return answer;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') throw new Error('Ollama tardo demasiado. Comprueba que el modelo local este cargado.');
+      if (error instanceof TypeError) throw new Error('No se pudo conectar con Ollama en ' + this.ollamaUrl + '. Inicialo y descarga el modelo configurado.');
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
   private async call(model: string, system: string, user: string): Promise<string> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);

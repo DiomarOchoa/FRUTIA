@@ -34,6 +34,8 @@ import { IdeaHistory } from './idea-history.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
 const STORAGE_DIR = process.env.STORAGE_DIR ?? path.resolve(process.cwd(), '../../storage');
+const LLM_PROVIDER = (process.env.FRUTIA_LLM_PROVIDER ?? 'gemini').trim().toLowerCase();
+const LOCAL_LLM = LLM_PROVIDER === 'ollama';
 
 /**
  * Limpia el BOM de las variables de entorno.
@@ -70,11 +72,11 @@ const queue = new JobQueue(CONCURRENCY);
 const ideas = new IdeaHistory(path.join(STORAGE_DIR, 'ideas-usadas.json'));
 
 const deps = (): PipelineDeps => ({
-  llm: new LlmProvider({ apiKey: GEMINI_API_KEY }),
+  llm: new LlmProvider({ apiKey: GEMINI_API_KEY, provider: LOCAL_LLM ? 'ollama' : 'gemini' }),
   // "auto" usa Google y cae a Pollinations si la cuota de imagenes se agota.
   image: new ImageProvider({
     apiKey: GEMINI_API_KEY,
-    prefer: (env('FRUTIA_IMAGE_PROVIDER') as 'auto' | 'gemini' | 'pollinations') || 'auto',
+    prefer: (env('FRUTIA_IMAGE_PROVIDER') as 'auto' | 'gemini' | 'pollinations' | 'comfyui') || 'auto',
   }),
   // La voz usa Google y, si su cuota se agota, cae sola al proveedor gratuito
   // con la misma clave de Pollinations que ya sirve para las imagenes.
@@ -136,7 +138,7 @@ const reorderSchema = z.object({
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    hasApiKey: Boolean(GEMINI_API_KEY),
+    hasApiKey: LOCAL_LLM || Boolean(GEMINI_API_KEY),
     queued: queue.list().filter((j) => j.status === 'queued' || j.status === 'running').length,
   });
 });
@@ -288,7 +290,7 @@ app.get('/api/stories/:id', async (req, res, next) => {
 
 app.post('/api/stories', async (req, res, next) => {
   try {
-    if (!GEMINI_API_KEY) {
+    if (!GEMINI_API_KEY && !LOCAL_LLM) {
       throw new ValidationError('Falta GEMINI_API_KEY en el servidor.');
     }
     const input = createStorySchema.parse(req.body);

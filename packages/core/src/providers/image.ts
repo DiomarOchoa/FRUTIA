@@ -11,6 +11,7 @@
  */
 
 import { PollinationsImageProvider } from './image-pollinations.js';
+import { ComfyUiImageProvider } from './comfyui.js';
 import { isModelRetired, ModelRetiredError, modelCandidates, withModelFallback } from './models.js';
 import type { GenerateImageInput, GenerateImageOutput } from './image-types.js';
 
@@ -28,7 +29,7 @@ export interface ResilientImageOptions {
    * Proveedor preferido: "auto" (por defecto) cae a Pollinations si Google
    * agota la cuota, "gemini" falla y "pollinations" usa solo el gratuito.
    */
-  prefer?: 'auto' | 'gemini' | 'pollinations';
+  prefer?: 'auto' | 'gemini' | 'pollinations' | 'comfyui';
   pollinationsModel?: string;
   /**
    * Ajustes de Pollinations: sobre todo `minIntervalSec`.
@@ -136,7 +137,8 @@ class QuotaExhaustedError extends Error {
 export class ImageProvider {
   private readonly gemini: GeminiImageProvider | undefined;
   private readonly pollinations: PollinationsImageProvider;
-  private readonly prefer: 'auto' | 'gemini' | 'pollinations';
+  private readonly comfyui: ComfyUiImageProvider | undefined;
+  private readonly prefer: 'auto' | 'gemini' | 'pollinations' | 'comfyui';
 
   /**
    * Momento en que Google vuelve a servir, si se pudo calcular.
@@ -160,9 +162,10 @@ export class ImageProvider {
 
   constructor(opts: ResilientImageOptions) {
     this.prefer = opts.prefer ?? 'auto';
+    this.comfyui = opts.prefer === 'comfyui' ? new ComfyUiImageProvider() : undefined;
     // En modo solo-Pollinations no se necesita clave de Google: exigirla
     // impedía usar el proveedor gratuito sin cuenta de Gemini.
-    this.gemini = opts.prefer === 'pollinations'
+    this.gemini = opts.prefer === 'pollinations' || opts.prefer === 'comfyui'
       ? undefined
       : new GeminiImageProvider({ apiKey: opts.apiKey });
     this.pollinations = new PollinationsImageProvider({
@@ -221,6 +224,11 @@ export class ImageProvider {
   }
 
   async generate(input: GenerateImageInput): Promise<GenerateImageOutput> {
+    if (this.prefer === 'comfyui') {
+      this.lastBackend = 'comfyui';
+      return this.comfyui!.generate(input);
+    }
+
     if (this.prefer === 'pollinations') {
       this.lastBackend = 'pollinations';
       return this.pollinations.generate(input);
