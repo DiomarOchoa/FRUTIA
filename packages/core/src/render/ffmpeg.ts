@@ -211,6 +211,53 @@ export async function composeStory(
   return outputPath;
 }
 
+/**
+ * Detecta donde empieza y termina la voz dentro de un audio, descartando el
+ * silencio inicial y final que dejan los motores TTS. Los subtitulos se
+ * reparten sobre ese tramo y no sobre el archivo entero, que es lo que los
+ * desfasaba. Si la deteccion falla, devuelve el audio completo.
+ */
+export async function probeSpeechSpan(
+  audioPath: string,
+  totalSec: number,
+): Promise<{ startSec: number; endSec: number }> {
+  const full = { startSec: 0, endSec: totalSec };
+  const bin = ffmpegPath;
+  if (!bin) return full;
+  try {
+    const log = await new Promise<string>((resolve, reject) => {
+      const proc: ChildProcessByStdio<null, null, Readable> = spawn(
+        bin,
+        ['-hide_banner', '-i', audioPath, '-af', 'silencedetect=noise=-35dB:d=0.12', '-f', 'null', '-'],
+        { stdio: ['ignore', 'ignore', 'pipe'] },
+      );
+      let out = '';
+      proc.stderr.on('data', (c: Buffer) => { out += c.toString(); });
+      proc.on('error', reject);
+      proc.on('close', () => resolve(out));
+    });
+    const starts = [...log.matchAll(/silence_start: (-?[\d.]+)/g)].map((m) => Number(m[1]));
+    const ends = [...log.matchAll(/silence_end: (-?[\d.]+)/g)].map((m) => Number(m[1]));
+    let startSec = 0;
+    let endSec = totalSec;
+    // Silencio inicial: arranca en ~0 y termina antes del final.
+    if (starts.length > 0 && starts[0]! <= 0.05 && ends.length > 0 && ends[0]! < totalSec) {
+      startSec = Math.max(0, ends[0]!);
+    }
+    // Silencio final: el ultimo silencio llega hasta el final del archivo (sin
+    // cierre, o cerrado por ffmpeg en la ultima marca).
+    const lastStart = starts[starts.length - 1];
+    const lastEnd = ends[ends.length - 1];
+    const reachesEnd = starts.length > ends.length || (lastEnd !== undefined && lastEnd >= totalSec - 0.05);
+    if (lastStart !== undefined && lastStart > startSec + 0.05 && reachesEnd) {
+      endSec = Math.min(totalSec, lastStart);
+    }
+    return endSec - startSec >= 0.3 ? { startSec, endSec } : full;
+  } catch {
+    return full;
+  }
+}
+
 /** Ejecuta ffmpeg y propaga los errores con contexto util. */
 function runFfmpeg(bin: string, args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {

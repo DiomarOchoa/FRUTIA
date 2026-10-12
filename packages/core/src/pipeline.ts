@@ -23,7 +23,7 @@ import { LlmProvider } from './providers/llm.js';
 import { ImageProvider } from './providers/image.js';
 import { TtsProvider } from './providers/tts.js';
 import { buildAss, cuesFromScene, type CueTiming } from './render/subtitles.js';
-import { composeStory, probeDuration, writeBase64File, type Shot } from './render/ffmpeg.js';
+import { composeStory, probeDuration, probeSpeechSpan, writeBase64File, type Shot } from './render/ffmpeg.js';
 
 export interface PipelineDeps {
   llm: LlmProvider;
@@ -331,7 +331,12 @@ export async function composeFinal(
     const imagePath = scene.variants[scene.activeVariant] ?? scene.variants[0];
     if (!imagePath || !scene.audioPath) continue;
     const durationMs = scene.targetDuration * 1000;
-    cues.push(cuesFromScene(scene.narration, durationMs, cursorMs));
+    // Los subtitulos se reparten solo sobre el tramo con voz, sin el silencio
+    // inicial/final del TTS; el plano completo sigue durando `durationMs`.
+    const span = await probeSpeechSpan(scene.audioPath, scene.targetDuration);
+    cues.push(
+      cuesFromScene(scene.narration, (span.endSec - span.startSec) * 1000, cursorMs + span.startSec * 1000),
+    );
     shots.push({ imagePath, audioPath: scene.audioPath, duration: scene.targetDuration });
     cursorMs += durationMs;
   }
