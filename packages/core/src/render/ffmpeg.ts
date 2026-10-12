@@ -31,6 +31,9 @@ export const VIDEO_WIDTH = 1080;
 export const VIDEO_HEIGHT = 1920;
 export const FPS = 30;
 
+/** Duracion maxima (s) del fundido entre planos. */
+export const TRANSITION_SEC = 0.3;
+
 /** Formato de un plano ya renderizado a imagen + audio. */
 export interface Shot {
   imagePath: string;
@@ -114,8 +117,8 @@ function preScale(): string {
 /**
  * Convierte una lista de planos en un unico MP4 de 9:16.
  *
- * Cada plano se procesa como un input independiente y se concatena con el
- * filtro `concat`. Cada plano lleva su audio, asi que el video ya sale con la
+ * Cada plano se procesa como un input independiente y se une con fundidos
+ * `xfade` (video) y `concat` (audio). Cada plano lleva su audio, asi que el video ya sale con la
  * pista de voz sincronizada toma a toma.
  */
 export async function composeStory(
@@ -134,11 +137,19 @@ export async function composeStory(
 
   const args: string[] = ['-y'];
 
+  // Fundido entre planos (`xfade`). Para no desincronizar voz y subtitulos, cada
+  // plano salvo el ultimo se alarga `tr` segundos y el fundido empieza justo en
+  // el limite de audio: la suma de duraciones de video sigue igualando a la del
+  // audio concatenado.
+  const minDur = Math.min(...shots.map((s) => s.duration));
+  const tr = shots.length > 1 ? Math.min(TRANSITION_SEC, minDur * 0.4) : 0;
+  const extra = (i: number): number => (i < shots.length - 1 ? tr : 0);
+
   // Un input por plano: imagen en bucle + audio.
   // `-framerate` fija la cadencia del bucle para que la imagen aporte
   // exactamente `dur * FPS` fotogramas y el plano mida lo que dice el audio.
-  shots.forEach((shot) => {
-    args.push('-loop', '1', '-framerate', String(FPS), '-t', shot.duration.toFixed(3), '-i', shot.imagePath);
+  shots.forEach((shot, i) => {
+    args.push('-loop', '1', '-framerate', String(FPS), '-t', (shot.duration + extra(i)).toFixed(3), '-i', shot.imagePath);
     args.push('-i', shot.audioPath);
   });
 
@@ -149,7 +160,7 @@ export async function composeStory(
     const imgIdx = i * 2;
     const audIdx = i * 2 + 1;
     const move = CAMERA_MOVES[i % CAMERA_MOVES.length]!;
-    const dur = shots[i]!.duration;
+    const dur = shots[i]!.duration + extra(i);
 
     videoChains.push(
       `[${imgIdx}:v]${preScale()},${zoompanFilter(move, dur)},setsar=1[v${i}]`,
@@ -157,11 +168,22 @@ export async function composeStory(
     audioChains.push(`[${audIdx}:a]aresample=48000,asetpts=N/SR/TB[a${i}]`);
   });
 
-  // Concatena videos, concatena audios.
-  const vLabels = shots.map((_, i) => `[v${i}]`).join('');
+  // Une los videos con xfade (o pasa el unico plano tal cual) y concatena audios.
   const aLabels = shots.map((_, i) => `[a${i}]`).join('');
+  const xfades: string[] = [];
+  let prev = 'v0';
+  let offset = 0;
+  for (let i = 1; i < shots.length; i++) {
+    offset += shots[i - 1]!.duration;
+    const out = i === shots.length - 1 ? 'vcat' : `x${i}`;
+    xfades.push(
+      `[${prev}][v${i}]xfade=transition=fade:duration=${tr.toFixed(3)}:offset=${offset.toFixed(3)}[${out}]`,
+    );
+    prev = out;
+  }
+  if (shots.length === 1) xfades.push('[v0]null[vcat]');
   let filter = `${videoChains.join(';')};${audioChains.join(';')};` +
-    `${vLabels}concat=n=${shots.length}:v=1:a=0[vcat];` +
+    `${xfades.join(';')};` +
     `${aLabels}concat=n=${shots.length}:v=0:a=1[acat]`;
 
   // Quema los subtitulos quemandolos sobre el video concatenado.
