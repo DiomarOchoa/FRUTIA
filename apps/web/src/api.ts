@@ -87,11 +87,13 @@ export const api = {
   getStory: (id: string) => request<Story>(`/api/stories/${id}`),
 
   createStory: (input: {
-    topic: string;
+    script?: string;
+    topic?: string;
     sceneCount?: number;
     styleId?: string;
     tone?: string;
     locale?: string;
+    imageProvider?: 'auto' | 'huggingface';
     seed?: number;
     /** Indice de la propuesta del generador, para marcarla como usada. */
     ideaIndex?: number;
@@ -136,6 +138,18 @@ export const api = {
   compose: (storyId: string) =>
     request<{ jobId: string }>(`/api/stories/${storyId}/compose`, { method: 'POST' }),
 
+  uploadMusic: (storyId: string, file: File) => request<Story>(`/api/stories/${storyId}/music`, {
+    method: 'PUT', headers: { 'Content-Type': file.type || audioMime(file.name) }, body: file,
+  }),
+
+  removeMusic: (storyId: string) =>
+    request<Story>(`/api/stories/${storyId}/music`, { method: 'DELETE' }),
+
+  uploadSceneImage: (storyId: string, sceneId: string, file: File) => request<Story>(
+    `/api/stories/${storyId}/scenes/${sceneId}/image`,
+    { method: 'PUT', headers: { 'Content-Type': file.type || imageMime(file.name) }, body: file },
+  ),
+
   deleteStory: (storyId: string) => request<void>(`/api/stories/${storyId}`, { method: 'DELETE' }),
 
   getJob: (jobId: string) => request<Job>(`/api/jobs/${jobId}`),
@@ -150,6 +164,16 @@ export const api = {
   markIdeaUsed: (idea: { index: number; topic: string; title: string }) =>
     request<void>('/api/ideas/usada', { method: 'POST', body: JSON.stringify(idea) }),
 };
+
+function audioMime(name: string): string {
+  const extension = name.split('.').pop()?.toLowerCase();
+  return ({ mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', ogg: 'audio/ogg', webm: 'audio/webm' } as Record<string, string>)[extension ?? ''] ?? 'application/octet-stream';
+}
+
+function imageMime(name: string): string {
+  const extension = name.split('.').pop()?.toLowerCase();
+  return ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' } as Record<string, string>)[extension ?? ''] ?? 'application/octet-stream';
+}
 
 /** Propuesta del generador aleatorio. */
 export interface Idea {

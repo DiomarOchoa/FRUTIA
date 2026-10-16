@@ -7,7 +7,7 @@
  * `dist/` con ESM nativo.
  */
 
-import { isModelRetired, ModelRetiredError, modelCandidates, withModelFallback } from './models.js';
+import { isModelRetired, isModelUnavailable, ModelRetiredError, ModelUnavailableError, modelCandidates, withModelFallback } from './models.js';
 
 const BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
@@ -61,25 +61,74 @@ export class LlmProvider {
    */
   async complete(system: string, user: string): Promise<string> {
     if (this.provider === 'ollama') return this.callOllama(system, user);
-    return withModelFallback(this.models, (model) => this.call(model, system, user));
+
+    // A diferencia de imagenes, aqui si conviene probar el siguiente modelo
+    // cuando el actual esta saturado o sin cuota: la cuota diaria del free
+    // tier se lleva por modelo y la saturacion tampoco es compartida.
+    return withModelFallback(
+      this.models,
+      (model) => this.call(model, system, user),
+      (error) => error instanceof ModelUnavailableError,
+    );
   }
 
+  /**
+   * Habla con Ollama en modo streaming.
+   *
+   * Antes la respuesta llegaba de una sola vez (`stream: false`). Con un modelo
+   * grande en CPU el guion tarda varios minutos y fetch (undici) corta la
+   * conexion a los 5 minutos sin recibir cabeceras; ese fallo es un TypeError y
+   * se mostraba como "no se pudo conectar", aunque Ollama estuviera vivo.
+   * Con streaming las cabeceras llegan al instante y el limite de tiempo pasa a
+   * ser de INACTIVIDAD: solo salta si el modelo deja de producir texto.
+   */
   private async callOllama(system: string, user: string): Promise<string> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const touch = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    };
     try {
       const res = await fetch(this.ollamaUrl + '/api/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ model: this.ollamaModel, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], format: 'json', stream: false, options: { temperature: 0.8, num_ctx: 8192, num_predict: 2048 } }),
+        body: JSON.stringify({ model: this.ollamaModel, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], format: 'json', stream: true, options: { temperature: 0.8, num_ctx: 8192, num_predict: 2048 } }),
       });
       if (!res.ok) throw new Error('Ollama ' + res.status + ': ' + (await res.text().catch(() => '')).slice(0, 300));
-      const json = await res.json() as { message?: { content?: string } };
-      const answer = json.message?.content?.trim();
-      if (!answer) throw new Error('Ollama devolvio una respuesta vacia.');
-      return answer;
+      if (!res.body) throw new Error('Ollama no devolvio datos.');
+
+      let answer = '';
+      const consume = (line: string) => {
+        if (!line.trim()) return;
+        const part = JSON.parse(line) as { message?: { content?: string }; error?: string };
+        if (part.error) throw new Error('Ollama: ' + part.error);
+        answer += part.message?.content ?? '';
+      };
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        touch();
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) consume(line);
+      }
+      consume(buffer + decoder.decode());
+
+      const text = answer.trim();
+      if (!text) throw new Error('Ollama devolvio una respuesta vacia.');
+      return text;
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') throw new Error('Ollama tardo demasiado. Comprueba que el modelo local este cargado.');
-      if (error instanceof TypeError) throw new Error('No se pudo conectar con Ollama en ' + this.ollamaUrl + '. Inicialo y descarga el modelo configurado.');
+      if (error instanceof Error && error.name === 'AbortError') throw new Error('Ollama dejo de responder. Comprueba que el modelo local este cargado.');
+      if (error instanceof TypeError) {
+        const code = (error.cause as { code?: string } | undefined)?.code;
+        if (code === 'ECONNREFUSED') throw new Error('No se pudo conectar con Ollama en ' + this.ollamaUrl + '. Inicialo y descarga el modelo configurado.');
+        throw new Error('Se corto la conexion con Ollama (' + (code ?? error.message) + '). Ollama sigue abierto?');
+      }
       throw error;
     } finally { clearTimeout(timer); }
   }
@@ -111,6 +160,13 @@ export class LlmProvider {
         const detail = await res.text().catch(() => '');
         if (isModelRetired(res.status, detail)) {
           throw new ModelRetiredError(`LLM ${res.status}: ${detail.slice(0, 300)}`);
+        }
+        // Saturado (503) o sin cuota (429) no son motivo para rendirse: el
+        // siguiente modelo de la lista tiene su propia capacidad y su propia
+        // cuota, y suele responder. Antes esto se propagaba y la app se
+        // quedaba sin guion aunque los dos siguientes estuvieran sanos.
+        if (isModelUnavailable(res.status, detail)) {
+          throw new ModelUnavailableError(`LLM ${res.status}: ${detail.slice(0, 300)}`);
         }
         throw new Error(this.explicarCuota(res.status, detail));
       }

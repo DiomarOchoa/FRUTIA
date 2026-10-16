@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { GenerateImageInput, GenerateImageOptions, GenerateImageOutput } from './image-types.js';
+import { COMFY_NEGATIVE_PROMPT, toClipPrompt } from './comfyui-prompt.js';
 
 type ComfyImage = { filename: string; subfolder: string; type: string };
 type ComfyEntry = { status?: { completed?: boolean }; outputs?: Record<string, { images?: ComfyImage[] }> };
@@ -10,7 +11,12 @@ export class ComfyUiImageProvider implements GenerateImageOptions {
   private readonly baseUrl = (process.env.COMFYUI_URL ?? 'http://127.0.0.1:8188').replace(/\/+$/, '');
   private readonly checkpoint = process.env.FRUTIA_COMFYUI_CHECKPOINT ?? 'v1-5-pruned-emaonly.safetensors';
   private readonly timeoutMs = Number(process.env.FRUTIA_COMFYUI_TIMEOUT_MS ?? 600_000);
-  private readonly steps = Math.max(1, Math.min(30, Number(process.env.FRUTIA_COMFYUI_STEPS ?? 6)));
+  // The installed checkpoint is plain SD 1.5, not a turbo model. Six steps
+  // produced unfinished, distorted characters; use a normal-quality schedule.
+  private readonly steps = Math.max(1, Math.min(30, Number(process.env.FRUTIA_COMFYUI_STEPS ?? 20)));
+
+  // FRUTIA_COMFYUI_RAW_PROMPT=1 desactiva la conversion a prompt corto (solo para comparar).
+  private readonly rawPrompt = process.env.FRUTIA_COMFYUI_RAW_PROMPT === '1';
 
   async generate(input: GenerateImageInput): Promise<GenerateImageOutput> {
     const promptId = await this.enqueue(input);
@@ -39,10 +45,10 @@ export class ComfyUiImageProvider implements GenerateImageOptions {
     const seed = input.seed ?? Math.floor(Math.random() * 2_147_483_647);
     const workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }> = {
       '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: this.checkpoint } },
-      '2': { class_type: 'CLIPTextEncode', inputs: { text: input.prompt, clip: ['1', 1] } },
-      '3': { class_type: 'CLIPTextEncode', inputs: { text: 'blurry, low quality, deformed, extra limbs, text, watermark', clip: ['1', 1] } },
-      '4': { class_type: 'EmptyLatentImage', inputs: { width: input.width ?? 512, height: input.height ?? 896, batch_size: 1 } },
-      '5': { class_type: 'KSampler', inputs: { seed, steps: this.steps, cfg: 7, sampler_name: 'euler', scheduler: 'normal', denoise: 1, model: ['1', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['4', 0] } },
+      '2': { class_type: 'CLIPTextEncode', inputs: { text: this.rawPrompt ? input.prompt : toClipPrompt(input.prompt), clip: ['1', 1] } },
+      '3': { class_type: 'CLIPTextEncode', inputs: { text: COMFY_NEGATIVE_PROMPT, clip: ['1', 1] } },
+      '4': { class_type: 'EmptyLatentImage', inputs: { width: input.width ?? 512, height: input.height ?? 768, batch_size: 1 } },
+      '5': { class_type: 'KSampler', inputs: { seed, steps: this.steps, cfg: 7, sampler_name: 'dpmpp_2m', scheduler: 'karras', denoise: 1, model: ['1', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['4', 0] } },
       '6': { class_type: 'VAEDecode', inputs: { samples: ['5', 0], vae: ['1', 2] } },
       '7': { class_type: 'SaveImage', inputs: { filename_prefix: 'frutia', images: ['6', 0] } },
     };

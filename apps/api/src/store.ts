@@ -10,7 +10,7 @@
 
 import { mkdir, readFile, readdir, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
-import type { Scene, Story } from '@frutia/core';
+import { repairStoryCharacterReferences, type Scene, type Story } from '@frutia/core';
 
 /**
  * Normaliza una historia venida de disco.
@@ -36,7 +36,7 @@ function migrate(story: Story): Story {
     }
     delete scene.imagePath;
   }
-  return story;
+  return repairStoryCharacterReferences(story);
 }
 
 export class StoryStore {
@@ -117,6 +117,7 @@ export class StoryStore {
       }
     }
 
+    delete story.videoPath;
     Object.assign(scene, patch);
     return this.save(story);
   }

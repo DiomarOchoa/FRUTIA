@@ -34,6 +34,7 @@ function SceneCard({
   story,
   scene,
   onPatch,
+  onUploadImage,
   onRegenerate,
   onDuplicate,
   onDelete,
@@ -44,6 +45,7 @@ function SceneCard({
   story: Story;
   scene: Scene;
   onPatch: (patch: Partial<Scene>) => Promise<void>;
+  onUploadImage: (file?: File) => void;
   onRegenerate: (opts: { variants: number; regenerateVoice: boolean }) => void;
   onDuplicate: () => void;
   onDelete: () => void;
@@ -167,6 +169,21 @@ function SceneCard({
           </button>
         </div>
 
+        <label className={`btn btn-sm scene-upload${disabled ? ' scene-upload-disabled' : ''}`}>
+          Subir imagen
+          <input
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            disabled={disabled}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.currentTarget.value = '';
+              onUploadImage(file);
+            }}
+            aria-label={`Subir imagen para el plano ${scene.index}`}
+          />
+        </label>
+
         <div className="row" style={{ gap: 5 }}>
           <button className="btn btn-sm" disabled={disabled || isFirst} onClick={() => onMove(-1)} title="Subir">&#8593;</button>
           <button className="btn btn-sm" disabled={disabled || isLast} onClick={() => onMove(1)} title="Bajar">&#8595;</button>
@@ -193,12 +210,14 @@ function SceneCard({
 export function StoryEditor({ story, onClose, onChanged }: StoryEditorProps) {
   const [current, setCurrent] = useState(story);
   const [busyScene, setBusyScene] = useState<string | null>(null);
+  const [musicBusy, setMusicBusy] = useState(false);
   const [regenJobId, setRegenJobId] = useState<string | null>(null);
   const [composeJobId, setComposeJobId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const composeJob = useJob(composeJobId);
   const regenJob = useJob(regenJobId);
+  const musicUrl = artifactUrl(current.musicPath);
 
   useEffect(() => setCurrent(story), [story]);
 
@@ -300,9 +319,50 @@ export function StoryEditor({ story, onClose, onChanged }: StoryEditorProps) {
     }
   };
 
+  const uploadMusic = async (file?: File) => {
+    if (!file) return;
+    setMusicBusy(true);
+    setError(null);
+    try {
+      setCurrent(await api.uploadMusic(current.id, file));
+      onChanged();
+    } catch (err) {
+      fail(err, 'No se pudo cargar la música.');
+    } finally {
+      setMusicBusy(false);
+    }
+  };
+
+  const uploadSceneImage = async (sceneId: string, file?: File) => {
+    if (!file) return;
+    setBusyScene(sceneId);
+    setError(null);
+    try {
+      setCurrent(await api.uploadSceneImage(current.id, sceneId, file));
+      onChanged();
+    } catch (err) {
+      fail(err, 'No se pudo subir la imagen.');
+    } finally {
+      setBusyScene(null);
+    }
+  };
+
+  const removeMusic = async () => {
+    setMusicBusy(true);
+    setError(null);
+    try {
+      setCurrent(await api.removeMusic(current.id));
+      onChanged();
+    } catch (err) {
+      fail(err, 'No se pudo quitar la música.');
+    } finally {
+      setMusicBusy(false);
+    }
+  };
+
   const approved = current.scenes.filter((s) => s.status === 'approved');
   const totalDuration = approved.reduce((acc, s) => acc + s.targetDuration, 0);
-  const videoReady = composeJob?.status === 'done' && approved.length > 0;
+  const videoReady = Boolean(current.videoPath) || (composeJob?.status === 'done' && approved.length > 0);
 
   // Cuantos segundos faltan para llegar al minuto que paga TikTok.
   const faltan = Math.max(0, 60 - totalDuration);
@@ -377,12 +437,41 @@ export function StoryEditor({ story, onClose, onChanged }: StoryEditorProps) {
 
       {error && <div className="alert alert-error">{error}</div>}
 
+      <section className="card music-card">
+        <div>
+          <div className="label">Música de fondo <span className="tiny faint">Opcional</span></div>
+          <p className="tiny faint" style={{ margin: '5px 0 10px' }}>
+            Sube tu pista y Frutia la mezcla suavemente bajo las voces al exportar.
+            MP3, M4A, AAC, WAV, OGG o WebM · máximo 25 MB.
+          </p>
+          <input
+            type="file"
+            accept="audio/mpeg,audio/mp4,audio/aac,audio/wav,audio/ogg,audio/webm"
+            disabled={musicBusy}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.currentTarget.value = '';
+              void uploadMusic(file);
+            }}
+            aria-label="Subir música de fondo"
+          />
+        </div>
+        {musicUrl && (
+          <div className="music-preview">
+            <audio controls src={musicUrl} preload="none" />
+            <button className="btn btn-sm" disabled={musicBusy} onClick={() => void removeMusic()}>
+              {musicBusy ? 'Guardando…' : 'Quitar pista'}
+            </button>
+          </div>
+        )}
+      </section>
+
       {regenJob && <JobProgress job={regenJob} />}
       <JobProgress job={composeJob} />
 
       {videoReady && (
         <div className="card">
-          <div className="label" style={{ marginBottom: 12 }}>Video final</div>
+          <div className="label" style={{ marginBottom: 12 }}>{current.videoPath ? 'Vista previa del MP4' : 'Video final'}</div>
           <video controls src={`/api/stories/${current.id}/video`} />
           <div className="row" style={{ marginTop: 14 }}>
             <a className="btn btn-primary btn-sm" href={`/api/stories/${current.id}/video`} download>
@@ -425,6 +514,7 @@ export function StoryEditor({ story, onClose, onChanged }: StoryEditorProps) {
               story={current}
               scene={scene}
               busy={busyScene === scene.id}
+              onUploadImage={(file) => void uploadSceneImage(scene.id, file)}
               regenerating={regenJob?.status === 'running' || regenJob?.status === 'queued'}
               onPatch={(patch) => patchScene(scene.id, patch)}
               onRegenerate={(opts) => regenerate(scene.id, opts)}
@@ -450,11 +540,16 @@ export function NewStoryForm({
   styles: StyleSpec[];
   onCreated: (jobId: string) => void;
 }) {
+  const [script, setScript] = useState('');
   const [topic, setTopic] = useState('');
-  const [tone, setTone] = useState('melodramatico con humor negro');
-  const [styleId, setStyleId] = useState(styles[0]?.id ?? 'stopmotion');
+  const [mode, setMode] = useState<'script' | 'idea'>('script');
+  const [tone, setTone] = useState('Melodrama viral, ritmo ágil y diálogos naturales');
+  const [styleId, setStyleId] = useState(styles[0]?.id ?? 'pixar3d');
+  const [locale, setLocale] = useState('es-419');
+  const [imageProvider, setImageProvider] = useState<'auto' | 'huggingface'>('auto');
   const [sceneCount, setSceneCount] = useState(8);
   const [variants, setVariants] = useState(1);
+  const [autoCompose, setAutoCompose] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -485,6 +580,7 @@ export function NewStoryForm({
 
   const pickIdea = (idea: Idea) => {
     setTopic(idea.topic);
+    setMode('idea');
     setIdeaIndex(idea.index);
   };
 
@@ -494,7 +590,12 @@ export function NewStoryForm({
     setError(null);
     try {
       const { jobId } = await api.createStory({
-        topic, tone, styleId, sceneCount, variants, ideaIndex,
+        ...(mode === 'script' ? { script } : { topic, ideaIndex }),
+        tone, styleId, sceneCount, variants, autoCompose, locale,
+        // "Automático" respeta la cadena de motores definida por el servidor
+        // (local en la instalación de Frutia); solo enviamos una preferencia
+        // cuando el usuario selecciona explícitamente Hugging Face.
+        ...(imageProvider !== 'auto' ? { imageProvider } : {}),
       });
       onCreated(jobId);
     } catch (err) {
@@ -504,19 +605,26 @@ export function NewStoryForm({
   };
 
   return (
-    <form className="card stack" onSubmit={submit}>
-      <div>
-        <h2>Nueva frutinovela</h2>
-        <p className="small dim" style={{ margin: '6px 0 0' }}>
-          Describe el tema en una frase. La IA arma el arco dramatico completo.
-        </p>
-      </div>
+    <form className="create-page" onSubmit={submit}>
+      <header className="create-heading">
+        <span className="eyebrow">ESTUDIO DE PRODUCCIÓN · 01</span>
+        <h1>Tu guion. Tu frutinovela.</h1>
+        <p>Pega la historia y Frutia la convierte en escenas, personajes, imágenes y voces.</p>
+      </header>
 
       {error && <div className="alert alert-error">{error}</div>}
 
+      <button type="button" className="text-button idea-mode-toggle" onClick={() => {
+        const nextMode = mode === 'script' ? 'idea' : 'script';
+        setMode(nextMode);
+        if (nextMode === 'idea' && ideas.length === 0) void loadIdeas();
+      }}>
+        {mode === 'script' ? 'No tengo guion · empezar desde una idea' : 'Volver a pegar un guion'}
+      </button>
+
       {/* Generador aleatorio: quita la friccion de decidir que hacer hoy y
           garantiza que la premisa no se haya contado antes. */}
-      <div className="card-inset stack" style={{ gap: 12 }}>
+      {mode === 'idea' && <div className="card-inset stack idea-panel" style={{ gap: 12 }}>
         <div className="row-between wrap">
           <div>
             <div style={{ fontWeight: 650, fontSize: '0.92rem' }}>Sorprendeme</div>
@@ -527,6 +635,7 @@ export function NewStoryForm({
             </p>
           </div>
           <button
+            type="button"
             className="btn btn-sm"
             onClick={loadIdeas}
             disabled={loadingIdeas}
@@ -540,6 +649,7 @@ export function NewStoryForm({
             {ideas.map((idea) => (
               <button
                 key={idea.index}
+                type="button"
                 className={`idea-card ${ideaIndex === idea.index ? 'idea-card-active' : ''}`}
                 onClick={() => pickIdea(idea)}
                 disabled={submitting}
@@ -553,9 +663,32 @@ export function NewStoryForm({
             </p>
           </div>
         )}
-      </div>
+      </div>}
 
-      <div>
+      {mode === 'script' ? <section className="script-card">
+        <div className="script-card-top">
+          <div>
+            <label className="field-title" htmlFor="script">Pega aquí tu guion</label>
+            <p className="field-hint">Diálogos, personajes y acotaciones. Frutia conserva tu historia.</p>
+          </div>
+          <span className={`script-count ${script.length > 15000 ? 'counter-warn' : ''}`}>{script.length.toLocaleString('es')} / 16.000</span>
+        </div>
+        <textarea
+          id="script"
+          className="script-input"
+          value={script}
+          onChange={(e) => setScript(e.target.value)}
+          placeholder={'FRESA: No puedo creer que me hayas mentido.\n\nMANGO baja la mirada. Uva aparece en la puerta.\n\nUVA: Hay algo que todavía no sabes…'}
+          rows={12}
+          required
+          minLength={3}
+          maxLength={16000}
+        />
+        <div className="script-card-bottom">
+          <span>Tip: escribe PERSONAJE: diálogo para indicar quién habla.</span>
+          <span>Hasta 16.000 caracteres</span>
+        </div>
+      </section> : <div>
         <div className="row-between">
           <label className="label" htmlFor="topic">Tema</label>
           <span className={`tiny ${topic.length > 1100 ? 'counter-warn' : 'faint'}`}>
@@ -580,8 +713,15 @@ export function NewStoryForm({
           Puedes pegar hasta 1200 caracteres: da para el argumento, los nombres
           de los personajes y el giro final.
         </p>
-      </div>
+      </div>}
 
+      <details className="optional-settings">
+        <summary><span>Opciones de producción</span><span>Opcional</span></summary>
+        <div className="settings-grid">
+          <label className="auto-compose-option">
+            <input type="checkbox" checked={autoCompose} onChange={(e) => setAutoCompose(e.target.checked)} />
+            <span><strong>Crear el MP4 automáticamente</strong><small>Frutia renderiza una vista previa al terminar las escenas y voces.</small></span>
+          </label>
       <div className="grid-styles">
         {styles.map((s) => (
           <button
@@ -597,6 +737,24 @@ export function NewStoryForm({
       </div>
 
       <div className="row wrap" style={{ gap: 14 }}>
+        <div className="grow" style={{ minWidth: 190 }}>
+          <label className="label" htmlFor="locale">Idioma de la historia</label>
+          <select id="locale" value={locale} onChange={(e) => setLocale(e.target.value)} style={{ marginTop: 7 }}>
+            <option value="es-419">Español latinoamericano</option>
+            <option value="en-US">English (US)</option>
+            <option value="pt-BR">Português (Brasil)</option>
+          </select>
+        </div>
+        <div className="grow" style={{ minWidth: 190 }}>
+          <label className="label" htmlFor="image-provider">Motor de imágenes</label>
+          <select id="image-provider" value={imageProvider} onChange={(e) => setImageProvider(e.target.value as 'auto' | 'huggingface')} style={{ marginTop: 7 }}>
+            <option value="auto">Automático · motores locales</option>
+            <option value="huggingface">Hugging Face · FLUX Schnell</option>
+          </select>
+          {imageProvider === 'huggingface'
+            ? <small className="tiny faint">Requiere HF_TOKEN en el .env del servidor. El uso de inferencia puede tener costo.</small>
+            : <small className="tiny faint">Usa ComfyUI local; evita gastar créditos. En este equipo la imagen se calcula con CPU.</small>}
+        </div>
         <div className="grow" style={{ minWidth: 200 }}>
           <label className="label" htmlFor="tone">Tono</label>
           <input
@@ -634,23 +792,23 @@ export function NewStoryForm({
           </select>
         </div>
       </div>
+        </div>
+      </details>
 
-      <div className="row-between wrap">
+      <div className="row-between wrap create-footer">
         <span className="tiny faint">
-          Aproximadamente {sceneCount * variants + 4} llamadas a la API
-          ({sceneCount} planos × {variants} tomas + fichas de personaje y voz).
-          Puede tardar 3-8 minutos.
+          Frutia prepara personajes, escenas, imágenes y voces. Luego puedes revisar cada plano.
         </span>
         <button
-          className="btn btn-primary"
-          disabled={submitting || topic.trim().length < 3}
+          className="btn btn-primary create-submit"
+          disabled={submitting || (mode === 'script' ? script.trim().length < 3 : topic.trim().length < 3)}
         >
-          {submitting ? 'Iniciando...' : 'Generar frutinovela'}
+          {submitting ? 'Preparando...' : 'Crear frutinovela'} <span aria-hidden="true">→</span>
         </button>
       </div>
 
       {/* Aviso antes de que el servidor rechace el envio. */}
-      {topic.length > 1200 && (
+      {mode === 'idea' && topic.length > 1200 && (
         <div className="alert alert-error">
           El tema tiene {topic.length} caracteres y el máximo es 1200.
           Recorta el texto para poder generar.
@@ -668,13 +826,23 @@ export function StoryList({
   stories,
   onOpen,
   onDelete,
+  onCreate,
 }: {
   stories: Array<{ id: string; title: string; premise: string; updatedAt: string; sceneCount: number; approvedCount: number }>;
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
+  onCreate: () => void;
 }) {
   if (stories.length === 0) {
-    return <p className="dim center small" style={{ padding: 30 }}>Todavia no hay historias.</p>;
+    return (
+      <section className="empty-state">
+        <div className="empty-fruit" aria-hidden="true">🍓</div>
+        <span className="eyebrow">TU ESTUDIO CREATIVO</span>
+        <h1>Tu próxima historia empieza aquí.</h1>
+        <p>Pega un guion y conviértelo en una frutinovela lista para revisar y exportar.</p>
+        <button className="btn btn-primary create-submit" onClick={onCreate}>Pegar mi guion <span aria-hidden="true">→</span></button>
+      </section>
+    );
   }
 
   return (

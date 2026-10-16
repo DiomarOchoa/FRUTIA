@@ -62,6 +62,8 @@ export interface SpeakInput {
   text: string;
   /** Voz del personaje a quien se le atribuye la narración sin marca. */
   narratorVoice?: string;
+  /** Idioma del guion; permite elegir una voz Edge del mismo idioma. */
+  locale?: string;
 }
 
 /** Audio listo para guardarse en disco. */
@@ -226,7 +228,7 @@ export class TtsProvider {
     // 3. Edge: red intermedia sin claves ni cuota.
     if (this.edge) {
       try {
-        const audio = await this.edge.speak(input.text);
+        const audio = await this.edge.speak(input.text, input.locale);
         this.lastBackend = 'edge';
         return normalizeAudio(audio.mimeType, audio.base64);
       } catch (error) {

@@ -18,6 +18,7 @@ import type { Readable } from 'node:stream';
 import { mkdir } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import type { QualityTier } from '../types.js';
 
 /**
  * `ffmpeg-static` es un paquete CommonJS que exporta la ruta al binario. Bajo
@@ -30,6 +31,21 @@ const ffmpegPath: string | null = require('ffmpeg-static');
 export const VIDEO_WIDTH = 1080;
 export const VIDEO_HEIGHT = 1920;
 export const FPS = 30;
+
+interface VideoProfile {
+  width: number;
+  height: number;
+  fps: number;
+  preset: string;
+  crf: number;
+}
+
+const VIDEO_PROFILES: Record<QualityTier, VideoProfile> = {
+  // Vista previa ligera para revisar guion, voz y ritmo sin esperar un render HD.
+  draft: { width: 540, height: 960, fps: 15, preset: 'ultrafast', crf: 25 },
+  standard: { width: 720, height: 1280, fps: 24, preset: 'veryfast', crf: 22 },
+  hd: { width: VIDEO_WIDTH, height: VIDEO_HEIGHT, fps: FPS, preset: 'medium', crf: 20 },
+};
 
 /** Duracion maxima (s) del fundido entre planos. */
 export const TRANSITION_SEC = 0.3;
@@ -72,8 +88,8 @@ export type CameraMove = (typeof CAMERA_MOVES)[number];
  * 0 a 1 durante el plano. La velocidad es entonces independiente de la
  * duracion: un plano de 2s y uno de 12s hacen el mismo trayecto en su tiempo.
  */
-function zoompanFilter(move: CameraMove, durationSec: number): string {
-  const frames = Math.max(2, Math.round(durationSec * FPS));
+function zoompanFilter(move: CameraMove, durationSec: number, profile: VideoProfile): string {
+  const frames = Math.max(2, Math.round(durationSec * profile.fps));
   // `on` va de 0 a frames-1; el divisor evita division por cero.
   const span = frames - 1;
 
@@ -99,18 +115,20 @@ function zoompanFilter(move: CameraMove, durationSec: number): string {
     'ih/2-(ih/zoom/2)';
 
   return (
-    `scale=${VIDEO_WIDTH * 2}:${VIDEO_HEIGHT * 2}:force_original_aspect_ratio=increase,` +
-    `crop=${VIDEO_WIDTH * 2}:${VIDEO_HEIGHT * 2},` +
+    // Las imágenes de partida ya son pequeñas; ampliarlas a 2x antes de
+    // zoompan solo multiplica el coste sin recuperar detalle real.
+    `scale=${profile.width}:${profile.height}:force_original_aspect_ratio=increase,` +
+    `crop=${profile.width}:${profile.height},` +
     `zoompan=z='${zoomExpr}':d=1:x='${xExpr}':y='${yExpr}':` +
-    `s=${VIDEO_WIDTH}x${VIDEO_HEIGHT}:fps=${FPS}`
+    `s=${profile.width}x${profile.height}:fps=${profile.fps}`
   );
 }
 
 /** Normaliza el tamano de la imagen antes de animarla. */
-function preScale(): string {
+function preScale(profile: VideoProfile): string {
   return (
-    `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=increase,` +
-    `crop=${VIDEO_WIDTH}:${VIDEO_HEIGHT}`
+    `scale=${profile.width}:${profile.height}:force_original_aspect_ratio=increase,` +
+    `crop=${profile.width}:${profile.height}`
   );
 }
 
@@ -126,8 +144,12 @@ export async function composeStory(
   subtitlePath: string | null,
   outputPath: string,
   workDir: string,
+  musicPath?: string,
+  quality: QualityTier = 'standard',
 ): Promise<string> {
   if (shots.length === 0) throw new Error('No hay planos que componer.');
+
+  const profile = VIDEO_PROFILES[quality];
 
   const bin = ffmpegPath;
   if (!bin) throw new Error('ffmpeg-static no resolvio el binario. Revisa la instalacion.');
@@ -149,9 +171,10 @@ export async function composeStory(
   // `-framerate` fija la cadencia del bucle para que la imagen aporte
   // exactamente `dur * FPS` fotogramas y el plano mida lo que dice el audio.
   shots.forEach((shot, i) => {
-    args.push('-loop', '1', '-framerate', String(FPS), '-t', (shot.duration + extra(i)).toFixed(3), '-i', shot.imagePath);
+    args.push('-loop', '1', '-framerate', String(profile.fps), '-t', (shot.duration + extra(i)).toFixed(3), '-i', shot.imagePath);
     args.push('-i', shot.audioPath);
   });
+  if (musicPath) args.push('-stream_loop', '-1', '-i', musicPath);
 
   // Filtro de video por plano: pre-escalado + Ken Burns.
   const videoChains: string[] = [];
@@ -163,7 +186,7 @@ export async function composeStory(
     const dur = shots[i]!.duration + extra(i);
 
     videoChains.push(
-      `[${imgIdx}:v]${preScale()},${zoompanFilter(move, dur)},setsar=1[v${i}]`,
+      `[${imgIdx}:v]${preScale(profile)},${zoompanFilter(move, dur, profile)},setsar=1[v${i}]`,
     );
     audioChains.push(`[${audIdx}:a]aresample=48000,asetpts=N/SR/TB[a${i}]`);
   });
@@ -186,6 +209,15 @@ export async function composeStory(
     `${xfades.join(';')};` +
     `${aLabels}concat=n=${shots.length}:v=0:a=1[acat]`;
 
+  let audioOutput = '[acat]';
+  if (musicPath) {
+    const musicIdx = shots.length * 2;
+    const duration = shots.reduce((sum, shot) => sum + shot.duration, 0);
+    filter += `;[${musicIdx}:a]aresample=48000,volume=0.14,atrim=duration=${duration.toFixed(3)},asetpts=N/SR/TB[bg];` +
+      '[acat][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]';
+    audioOutput = '[aout]';
+  }
+
   // Quema los subtitulos quemandolos sobre el video concatenado.
   if (subtitlePath) {
     const subPath = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
@@ -195,11 +227,11 @@ export async function composeStory(
   }
 
   args.push('-filter_complex', filter);
-  args.push('-map', '[vout]', '-map', '[acat]');
+  args.push('-map', '[vout]', '-map', audioOutput);
   args.push(
     '-c:v', 'libx264',
-    '-preset', 'medium',
-    '-crf', '20',
+    '-preset', profile.preset,
+    '-crf', String(profile.crf),
     '-pix_fmt', 'yuv420p',
     '-c:a', 'aac',
     '-b:a', '192k',

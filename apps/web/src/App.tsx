@@ -14,6 +14,8 @@ export default function App() {
   const [draftJobId, setDraftJobId] = useState<string | null>(null);
   const [health, setHealth] = useState<{ hasApiKey: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [listLoadFailed, setListLoadFailed] = useState(false);
+  const [listRetryAttempt, setListRetryAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
 
   const draftJob = useJob(draftJobId);
@@ -33,8 +35,13 @@ export default function App() {
   const refresh = useCallback(async () => {
     try {
       setStories(await api.listStories());
+      setError(null);
+      setListLoadFailed(false);
+      setListRetryAttempt(0);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'No se pudo cargar la lista.');
+      setListLoadFailed(true);
+      setListRetryAttempt((attempt) => attempt + 1);
     }
   }, []);
 
@@ -43,6 +50,16 @@ export default function App() {
     void api.health().then(setHealth).catch(() => undefined);
     void api.styles().then(setStyles).catch(() => undefined);
   }, [refresh]);
+
+  // Si la API está reiniciando cuando abre el navegador, recuperar la
+  // biblioteca sin exigirle al usuario que recargue manualmente la página.
+  useEffect(() => {
+    if (!listLoadFailed || view.name !== 'list') return;
+    const exponent = Math.min(Math.max(listRetryAttempt - 1, 0), 5);
+    const delay = Math.min(1_000 * 2 ** exponent, 30_000);
+    const timer = window.setTimeout(() => { void refresh(); }, delay);
+    return () => window.clearTimeout(timer);
+  }, [listLoadFailed, listRetryAttempt, view.name, refresh]);
 
   // Cuando el borrador termina, abrimos la historia para revisarla.
   useEffect(() => {
@@ -105,7 +122,14 @@ export default function App() {
       </header>
 
       <main className="main stack">
-        {error && <div className="alert alert-error">{error}</div>}
+        {error && (
+          <div className="alert alert-error" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <span>{error}</span>
+            {view.name === 'list' && (
+              <button className="btn btn-sm" onClick={() => { void refresh(); }}>Reintentar</button>
+            )}
+          </div>
+        )}
 
         {view.name === 'new' && (
           <>
@@ -122,7 +146,12 @@ export default function App() {
 
         {view.name === 'list' && (
           <>
-            <StoryList stories={stories} onOpen={openStory} onDelete={deleteStory} />
+            <StoryList
+              stories={stories}
+              onOpen={openStory}
+              onDelete={deleteStory}
+              onCreate={() => setView({ name: 'new' })}
+            />
             {draftJob && <JobProgress job={draftJob} onCancel={cancelDraft} />}
           </>
         )}

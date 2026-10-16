@@ -8,6 +8,7 @@
  */
 
 import { mkdir, readFile } from 'node:fs/promises';
+import { statSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -82,7 +83,7 @@ export function secondsToMonetizable(story: Story, opts: { requireApproval: bool
 
 export async function writeScript(
   deps: PipelineDeps,
-  opts: { topic: string; sceneCount?: number; styleId?: string; tone?: string; locale?: string; seed?: number },
+  opts: { topic: string; sceneCount?: number; styleId?: string; tone?: string; locale?: string; seed?: number; isFullScript?: boolean },
 ): Promise<Story> {
   deps.onProgress?.({ stage: 'script', completed: 0, total: 1, status: 'running', message: 'Escribiendo guion' });
 
@@ -90,6 +91,7 @@ export async function writeScript(
     SYSTEM_PROMPT,
     buildScriptUserPrompt({
       topic: opts.topic,
+      isFullScript: opts.isFullScript,
       sceneCount: opts.sceneCount,
       styleId: opts.styleId,
       tone: opts.tone,
@@ -99,6 +101,7 @@ export async function writeScript(
   );
 
   const story = parseStoryResponse(raw, randomUUID(), opts.styleId);
+  story.locale = opts.locale ?? 'es-419';
   deps.onProgress?.({ stage: 'script', completed: 1, total: 1, status: 'done', message: `${story.scenes.length} planos` });
   return story;
 }
@@ -122,59 +125,144 @@ export async function writeScript(
 export async function generateImages(
   deps: PipelineDeps,
   story: Story,
-  opts: { variants?: number; imageSeed?: number } = {},
+  opts: { variants?: number; imageSeed?: number; resume?: boolean } = {},
 ): Promise<Story> {
   const dir = path.join(deps.storageDir, story.id, 'scenes');
   await mkdir(dir, { recursive: true });
   const variantCount = Math.max(1, Math.min(4, opts.variants ?? 1));
 
-  // Hojas de personaje.
-  for (const character of story.characters) {
-    if (character.referenceImagePath) continue;
-    const prompt = buildCharacterSheetPrompt(character, story.visualStyleId);
-    const { base64 } = await deps.image.generate({ prompt });
-    const out = path.join(dir, `ref-${character.id}.png`);
-    await writeBase64File(base64, out);
-    character.referenceImagePath = out;
+  // Reanudar una historia a medio generar.
+  //
+  // El modo $0 hace que esto sea la norma y no la excepcion: el proveedor
+  // gratuito falla de varias maneras a la vez, asi que una historia de trece
+  // planos suele detenerse en el ocho o el nueve. Sin esto, el segundo intento
+  // vuelve a pagar las cuatro fichas de personaje y los siete planos que ya
+  // estaban bien, y vuelve a caer en el mismo sitio.
+  //
+  // Solo se reutiliza lo que esta REAL en disco. Un plano marcado como
+  // generado con su archivo borrado se vuelve a hacer: dar por buena una
+  // imagen que no existe es peor que repetirla.
+  const resume = opts.resume ?? true;
+  let reutilizadas = 0;
+
+  // Pollinations ignora referencias visuales: saltar estas llamadas ahorra
+  // una imagen por personaje sin cambiar el resultado de ese proveedor.
+  if (deps.image.supportsReferenceImages) {
+    for (const character of story.characters) {
+      if (character.referenceImagePath && existeEnDisco(character.referenceImagePath)) continue;
+      deps.onProgress?.({ stage: 'images', completed: 0, total: story.scenes.length,
+        status: 'running', message: `Preparando personaje: ${character.name}` });
+      const prompt = buildCharacterSheetPrompt(character, story.visualStyleId);
+      const { base64 } = await deps.image.generate({ prompt });
+      const out = path.join(dir, `ref-${character.id}.png`);
+      await writeBase64File(base64, out);
+      character.referenceImagePath = out;
+    }
   }
 
-  // Planos.
-  for (const scene of story.scenes) {
-    // Se comprueba antes de empezar cada plano: la cancelacion es
-    // cooperativa y aqui es donde el trabajo se puede cortar limpiamente.
-    checkStop(deps);
-
-    deps.onProgress?.({
-      stage: 'images', completed: scene.index - 1, total: story.scenes.length,
-      status: 'running', message: `Plano ${scene.index}`,
-    });
-
-    const references = await loadReferences(castFor(story, scene));
-    const prompt = buildSceneImagePrompt(
-      scene.shotDescription, castFor(story, scene), story.visualStyleId, story.visualStyle,
-    );
-
-    scene.variants = [];
-    for (let v = 0; v < variantCount; v++) {
+  // Mantener el progreso ordenado mientras un pequeño grupo genera planos.
+  // Los proveedores anónimos/Google permanecen secuenciales por sus cuotas.
+  //
+  // El `?? 1` y el `Number.isFinite` no son decimales: `Math.max(1, Math.min(undefined, n))`
+  // da `NaN`, `Array.from({ length: NaN })` da un array VACÍO y el bucle de
+  // trabajadores no arranca ni uno solo. El pipeline termina "con éxito" con
+  // cero imágenes y sin decir nada: el fallo más caro posible, porque el
+  // usuario ve la historia completa y solo un MP4 que no se puede componer.
+  // Cualquier proveedor que no declare `recommendedConcurrency` disparaba eso.
+  let completed = 0;
+  let cursor = 0;
+  const pedido = deps.image.recommendedConcurrency;
+  const limite = Number.isFinite(pedido) && (pedido as number) >= 1 ? Math.floor(pedido as number) : 1;
+  const concurrency = Math.max(1, Math.min(limite, story.scenes.length));
+  const worker = async () => {
+    while (true) {
+      const scene = story.scenes[cursor++];
+      if (!scene) return;
       checkStop(deps);
-      const { base64 } = await deps.image.generate({
-        prompt,
-        referenceImages: references,
-        // Cada variante avanza la semilla para que difieran de verdad.
-        seed: opts.imageSeed === undefined ? undefined : opts.imageSeed + scene.index * 100 + v,
-      });
-      const out = path.join(dir, `${scene.id}-v${v}.png`);
-      await writeBase64File(base64, out);
-      scene.variants.push(out);
-    }
 
-    scene.activeVariant = 0;
-    scene.attempts += variantCount;
-    scene.status = 'generated';
+      // Un plano ya completo y presente en disco no se vuelve a pedir.
+      if (resume && tieneImagenesUtiles(scene, variantCount)) {
+        reutilizadas++;
+        scene.activeVariant = Math.min(scene.activeVariant, scene.variants.length - 1);
+        scene.status = 'generated';
+        completed++;
+        deps.onProgress?.({ stage: 'images', completed, total: story.scenes.length,
+          status: 'running', message: `Plano ${scene.index} ya estaba listo` });
+        continue;
+      }
+
+      deps.onProgress?.({ stage: 'images', completed, total: story.scenes.length,
+        status: 'running', message: `Generando plano ${scene.index} de ${story.scenes.length}` });
+
+      const cast = castFor(story, scene);
+      const references = deps.image.supportsReferenceImages ? await loadReferences(cast) : [];
+      const prompt = buildSceneImagePrompt(scene.shotDescription, cast, story.visualStyleId, story.visualStyle);
+      scene.variants = [];
+      for (let v = 0; v < variantCount; v++) {
+        checkStop(deps);
+        const { base64 } = await deps.image.generate({
+          prompt,
+          referenceImages: references,
+          seed: opts.imageSeed === undefined ? undefined : opts.imageSeed + scene.index * 100 + v,
+        });
+        const out = path.join(dir, `${scene.id}-v${v}.png`);
+        await writeBase64File(base64, out);
+        scene.variants.push(out);
+      }
+      scene.activeVariant = 0;
+      scene.attempts += variantCount;
+      scene.status = 'generated';
+      completed++;
+      deps.onProgress?.({ stage: 'images', completed, total: story.scenes.length,
+        status: 'running', message: `${completed} de ${story.scenes.length} planos listos` });
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  if (reutilizadas > 0) {
+    deps.onProgress?.({ stage: 'images', completed: story.scenes.length, total: story.scenes.length,
+      status: 'done', message: `${reutilizadas} planos ya estaban listos` });
+  }
+
+  // Comprobacion de la ultima linea. Todo lo de arriba puede "terminar bien"
+  // y no haber producido nada: un planificador mal calculado, un proveedor que
+  // se traga los errores, un `scene.variants` que se sobrescribe. Sin esto, el
+  // trabajo se guarda como completo con una historia sin imagenes y el fallo
+  // solo aparece tres etapas mas tarde, cuando el render dice que no hay tomas.
+  const sinImagenes = story.scenes.filter((s) => !s.variants?.length);
+  if (sinImagenes.length > 0) {
+    throw new DomainError(
+      `No se genero ninguna imagen para ${sinImagenes.length} de ${story.scenes.length} planos ` +
+      `(primero: ${sinImagenes[0]!.index}). Revisa las claves y el proveedor de imagenes.`,
+      'invalid',
+    );
   }
 
   deps.onProgress?.({ stage: 'images', completed: story.scenes.length, total: story.scenes.length, status: 'done' });
   return story;
+}
+
+/** Un archivo existe y pesa lo bastante para ser una imagen de verdad. */
+function existeEnDisco(ruta: string | undefined): boolean {
+  if (!ruta) return false;
+  try {
+    return statSync(ruta).size > 1024;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ¿Este plano ya se puede reutilizar tal cual?
+ *
+ * Exige las tres cosas: las variantes que hacen falta, que los archivos sigan
+ * ahi y que no sean de 0 bytes. Un plano marcado como listo con el archivo
+ * borrado tiene que volver a generarse: dar por buena una imagen que no existe
+ * rompe el render mas tarde, cuando ya es mas caro de diagnosticar.
+ */
+function tieneImagenesUtiles(scene: Scene, variantCount: number): boolean {
+  if (scene.variants.length < variantCount) return false;
+  return scene.variants.every((v) => existeEnDisco(v));
 }
 
 /** Personajes visibles en un plano. */
@@ -245,7 +333,7 @@ async function synthesizeScene(deps: PipelineDeps, story: Story, scene: Scene): 
   if (!spoken) return;
 
   // La extension la decide la API: devuelve PCM crudo envuelto en WAV, no MP3.
-  const audio = await deps.tts.speak({ text: spoken });
+  const audio = await deps.tts.speak({ text: spoken, locale: story.locale });
   const out = path.join(dir, `${scene.id}.${audio.extension}`);
   await writeBase64File(audio.base64, out);
   scene.audioPath = out;
@@ -353,7 +441,7 @@ export async function composeFinal(
   deps.onProgress?.({ stage: 'compose', completed: 0, total: 1, status: 'running', message: 'Renderizando' });
 
   const outputPath = path.join(dir, `${story.id}.mp4`);
-  await composeStory(shots, subtitlePath, outputPath, dir);
+  await composeStory(shots, subtitlePath, outputPath, dir, story.musicPath, config.quality);
 
   // ffmpeg puede terminar con codigo 0 y dejar un archivo vacio si se le corta
   // a mitad, por ejemplo cuando el servidor se reinicia durante el render. Sin
@@ -392,6 +480,8 @@ export async function composeFinal(
 
 export interface RunPipelineOptions {
   topic: string;
+  /** El usuario pegó un guion que se debe adaptar a planos, no una premisa. */
+  isFullScript?: boolean;
   sceneCount?: number;
   styleId?: string;
   tone?: string;
@@ -412,6 +502,7 @@ export interface RunPipelineOptions {
 export async function runDraftPipeline(deps: PipelineDeps, opts: RunPipelineOptions): Promise<Story> {
   const story = await writeScript(deps, {
     topic: opts.topic,
+    isFullScript: opts.isFullScript,
     sceneCount: opts.sceneCount,
     styleId: opts.styleId,
     tone: opts.tone,

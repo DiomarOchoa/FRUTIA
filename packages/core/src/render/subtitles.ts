@@ -40,14 +40,14 @@ export interface SubtitleStyle {
 
 /** Estilo por defecto: blanco con palabra activa en amarillo, contorno grueso. */
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
-  fontName: 'Anton',
-  fontSize: 78,
+  fontName: 'Arial',
+  fontSize: 68,
   primaryColor: '&H00FFFFFF',
   highlightColor: '&H0049E0FF',
   outlineColor: '&H00101010',
-  outlineWidth: 6,
-  shadowDepth: 2,
-  marginVertical: 260,
+  outlineWidth: 4,
+  shadowDepth: 1,
+  marginVertical: 220,
 };
 
 /** Palabras que nunca se resaltan solas: no aportan ritmo. */
@@ -116,13 +116,42 @@ function escapeAss(text: string): string {
   return text.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}').replace(/\n/g, '\\N');
 }
 
+/** Format a short, centered caption with explicit line breaks for ASS. */
+function formatContext(words: WordTiming[], activeIndex: number, style: SubtitleStyle): string {
+  const from = Math.max(0, activeIndex - 2);
+  const to = Math.min(words.length - 1, activeIndex + 2);
+  const lines: { word: string; index: number }[][] = [[]];
+  let lineLength = 0;
+
+  for (let j = from; j <= to; j++) {
+    const word = words[j]!.word;
+    const current = lines[lines.length - 1]!;
+    const nextLength = lineLength + (current.length ? 1 : 0) + word.length;
+    if (current.length && nextLength > 24 && lines.length < 2) {
+      lines.push([]);
+      lineLength = 0;
+    }
+    const target = lines[lines.length - 1]!;
+    lineLength += (target.length ? 1 : 0) + word.length;
+    target.push({ word, index: j });
+  }
+
+  return lines
+    .filter((line) => line.length)
+    .map((line) => line.map(({ word, index }) => {
+      const text = escapeAss(word);
+      return index === activeIndex
+        ? `{\\c${style.highlightColor}}${text}{\\c${style.primaryColor}}`
+        : text;
+    }).join(' '))
+    .join('\\N');
+}
+
 /**
  * Genera un archivo ASS con la animacion palabra-a-palabra.
  *
- * Cada palabra se emite como un evento `Dialogue` propio que cubre de `startMs`
- * a `endMs`, con la palabra en color de resalte y las demas en blanco. La
- * ventana de la palabra activa se extiende ligeramente para evitar parpadeo
- * entre eventos contiguos.
+ * Cada palabra se emite como un evento `Dialogue` propio, con la palabra
+ * activa en color de resalte y un contexto breve envuelto en dos líneas.
  */
 export function buildAss(
   cues: CueTiming[],
@@ -162,26 +191,16 @@ export function buildAss(
   ];
 
   const events: string[] = [];
-  const OVERLAP_MS = 40;
-
   for (const cue of cues) {
     for (let i = 0; i < cue.words.length; i++) {
       const w = cue.words[i]!;
-      const activeStart = Math.max(0, w.startMs - OVERLAP_MS);
-      const activeEnd = w.endMs + (w.pauseAfter * 1000) / 2 + OVERLAP_MS;
-
-      // Contexto: hasta tres palabras alrededor, para que la frase se lea entera.
-      const from = Math.max(0, i - 3);
-      const to = Math.min(cue.words.length - 1, i + 3);
-      const pieces: string[] = [];
-      for (let j = from; j <= to; j++) {
-        const word = cue.words[j]!;
-        const text = escapeAss(word.word);
-        pieces.push(j === i ? `{\\c${style.highlightColor}}${text}{\\c${style.primaryColor}}` : text);
-      }
+      // Timings are contiguous: overlapping events draw duplicate captions.
+      const activeStart = w.startMs;
+      const activeEnd = Math.max(w.endMs, w.startMs + 40);
+      const caption = formatContext(cue.words, i, style);
 
       events.push(
-        `Dialogue: 0,${assTimestamp(activeStart)},${assTimestamp(activeEnd)},Pop,,0,0,0,,${pieces.join(' ')}`,
+        `Dialogue: 0,${assTimestamp(activeStart)},${assTimestamp(activeEnd)},Pop,,0,0,0,,${caption}`,
       );
     }
   }

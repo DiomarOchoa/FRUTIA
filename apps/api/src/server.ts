@@ -11,6 +11,7 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import cors from 'cors';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { z } from 'zod';
 
 import {
@@ -19,6 +20,7 @@ import {
   ImageProvider,
   LlmProvider,
   TtsProvider,
+  type ImageProviderPreference,
   composeFinal,
   deleteScene,
   duplicateScene,
@@ -32,8 +34,16 @@ import { JobQueue } from './jobs.js';
 import { NotFoundError, StoryStore, ValidationError } from './store.js';
 import { IdeaHistory } from './idea-history.js';
 
+// Al ejecutar la API como workspace, cargar el .env desde la raíz del repo.
+// Esto también hace que los cambios de proveedores se apliquen al reiniciar tsx watch.
+const localEnvPath = path.resolve(process.cwd(), '../../.env');
+if (existsSync(localEnvPath)) process.loadEnvFile(localEnvPath);
+
 const PORT = Number(process.env.PORT ?? 4000);
-const STORAGE_DIR = process.env.STORAGE_DIR ?? path.resolve(process.cwd(), '../../storage');
+// El store y las URLs de artefactos necesitan una ruta estable, no relativa al
+// cwd que npm elija para la app workspace.
+const STORAGE_DIR = path.resolve(process.env.STORAGE_DIR ?? path.resolve(process.cwd(), '../../storage'));
+// El perfil local se carga desde .env al iniciar (Ollama + ComfyUI + Piper).
 const LLM_PROVIDER = (process.env.FRUTIA_LLM_PROVIDER ?? 'gemini').trim().toLowerCase();
 const LOCAL_LLM = LLM_PROVIDER === 'ollama';
 
@@ -71,12 +81,17 @@ const store = new StoryStore(STORAGE_DIR);
 const queue = new JobQueue(CONCURRENCY);
 const ideas = new IdeaHistory(path.join(STORAGE_DIR, 'ideas-usadas.json'));
 
-const deps = (): PipelineDeps => ({
+const configuredImageProvider = (): ImageProviderPreference => {
+  const selected = env('FRUTIA_IMAGE_PROVIDER') as ImageProviderPreference | '';
+  return selected || 'auto';
+};
+
+const deps = (imageProvider?: ImageProviderPreference): PipelineDeps => ({
   llm: new LlmProvider({ apiKey: GEMINI_API_KEY, provider: LOCAL_LLM ? 'ollama' : 'gemini' }),
-  // "auto" usa Google y cae a Pollinations si la cuota de imagenes se agota.
+  // "auto" prueba Google y, si agota la cuota, los respaldos configurados.
   image: new ImageProvider({
     apiKey: GEMINI_API_KEY,
-    prefer: (env('FRUTIA_IMAGE_PROVIDER') as 'auto' | 'gemini' | 'pollinations' | 'comfyui') || 'auto',
+    prefer: imageProvider ?? configuredImageProvider(),
   }),
   // La voz usa Google y, si su cuota se agota, cae sola al proveedor gratuito
   // con la misma clave de Pollinations que ya sirve para las imagenes.
@@ -93,11 +108,10 @@ app.use(express.json({ limit: '1mb' }));
 // ─────────────────────────────────────────────────────────────────────────────
 
 const createStorySchema = z.object({
-  // 1200 caracteres permiten pegar un resumen del guion con los personajes
-  // described, sin tener que recortar hasta que quepa. El LLM tiene ventana
-  // de sobra para procesarlo.
-  topic: z.string().min(3, 'Escribe un tema de al menos 3 caracteres.').max(1200,
-    'El tema es demasiado largo (máximo 1200 caracteres). Resume el argumento.'),
+  // La ruta admite guiones completos y conserva `topic` para las historias
+  // antiguas basadas en una idea corta.
+  script: z.string().trim().min(3).max(16000).optional(),
+  topic: z.string().trim().min(3).max(1200).optional(),
   sceneCount: z.number().int().min(4).max(14).optional(),
   styleId: z.string().optional(),
   tone: z.string().max(300).optional(),
@@ -108,8 +122,12 @@ const createStorySchema = z.object({
   ideaIndex: z.number().int().optional(),
   /** Cuantas imagenes candidatas por plano (1 a 4). */
   variants: z.number().int().min(1).max(4).optional(),
+  imageProvider: z.enum(['auto', 'huggingface']).optional(),
   /** Si se omite, el pipeline se detiene tras generar y espera curacion. */
-  autoCompose: z.boolean().default(false),
+  autoCompose: z.boolean().default(true),
+}).refine((input) => Boolean(input.script || input.topic), {
+  message: 'Pega un guion para empezar.',
+  path: ['script'],
 });
 
 const patchSceneSchema = z.object({
@@ -295,6 +313,11 @@ app.post('/api/stories', async (req, res, next) => {
     }
     const input = createStorySchema.parse(req.body);
 
+    const selectedImageProvider = input.imageProvider ?? configuredImageProvider();
+    if (selectedImageProvider === 'huggingface' && !env('HF_TOKEN') && !env('HUGGINGFACE_API_KEY')) {
+      throw new ValidationError('Para usar Hugging Face, agrega HF_TOKEN al .env del servidor y reinicia Frutia.');
+    }
+
     const job = queue.enqueue('draft', undefined, async (job, emit) => {
       // La cancelacion se conecta aqui: el pipeline la consulta entre etapas.
       const stopped = { flag: false };
@@ -302,14 +325,15 @@ app.post('/api/stories', async (req, res, next) => {
 
       const story = await runDraftPipeline(
         {
-          ...deps(),
+          ...deps(input.imageProvider),
           onProgress: emit,
           shouldStop: () => {
             if (stopped.flag) throw new DomainError('Cancelado por el usuario.', 'invalid');
           },
         },
         {
-          topic: input.topic,
+          topic: input.script ?? input.topic!,
+          isFullScript: Boolean(input.script),
           sceneCount: input.sceneCount,
           styleId: input.styleId,
           tone: input.tone,
@@ -325,7 +349,7 @@ app.post('/api/stories', async (req, res, next) => {
 
       // Una idea generada se marca como usada: volver a proponerla seria
       // repetirla en el canal, y el usuario no tendria forma de enterarse.
-      if (input.ideaIndex !== undefined) {
+      if (input.ideaIndex !== undefined && input.topic) {
         await ideas.add({
           index: input.ideaIndex,
           topic: input.topic,
@@ -335,15 +359,16 @@ app.post('/api/stories', async (req, res, next) => {
         });
       }
 
-      // `autoCompose` solo tiene efecto en desarrollo: en produccion la
-      // aprobacion humana es obligatoria y no se puede saltar.
-      if (input.autoCompose && process.env.NODE_ENV !== 'production') {
-        await composeFinal({ ...deps(), onProgress: emit }, story, {
-          quality: 'standard',
+      // El render crea un borrador local; nunca publica contenido. La
+      // aprobación humana sigue siendo necesaria para la exportación final.
+      if (input.autoCompose) {
+        const videoPath = await composeFinal({ ...deps(), onProgress: emit }, story, {
+          quality: 'draft',
           requireApproval: false,
         });
+        await store.mutate(story.id, (draft) => { draft.videoPath = videoPath; });
+        return videoPath;
       }
-      return story.id;
     });
 
     res.status(202).json({ jobId: job.id });
@@ -375,10 +400,81 @@ app.post('/api/stories/:id/compose', async (req, res, next) => {
         story,
         { quality: 'standard', requireApproval },
       );
+      await store.mutate(story.id, (draft) => { draft.videoPath = outputPath; });
       return outputPath;
     });
 
     res.status(202).json({ jobId: job.id });
+  } catch (error) { next(error); }
+});
+
+/** Sube o reemplaza la música de fondo de una historia (máximo 25 MB). */
+app.put('/api/stories/:id/music', express.raw({ type: 'audio/*', limit: '25mb' }), async (req, res, next) => {
+  try {
+    const story = await store.get(req.params.id);
+    if (!story) throw new NotFoundError('Historia no encontrada.');
+    const extensions: Record<string, string> = {
+      'audio/mpeg': '.mp3', 'audio/mp3': '.mp3', 'audio/mp4': '.m4a', 'audio/x-m4a': '.m4a',
+      'audio/aac': '.aac', 'audio/wav': '.wav', 'audio/x-wav': '.wav',
+      'audio/ogg': '.ogg', 'audio/webm': '.webm',
+    };
+    const contentType = req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() ?? '';
+    const extension = extensions[contentType];
+    if (!extension) throw new ValidationError('Formato de audio no compatible. Usa MP3, M4A, AAC, WAV, OGG o WebM.');
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new ValidationError('Selecciona un archivo de audio.');
+
+    const musicPath = path.join(STORAGE_DIR, story.id, `music${extension}`);
+    await mkdir(path.dirname(musicPath), { recursive: true });
+    await writeFile(musicPath, req.body);
+    const updated = await store.mutate(story.id, (draft) => {
+      draft.musicPath = musicPath;
+      delete draft.videoPath;
+    });
+    if (story.musicPath && story.musicPath !== musicPath) await rm(story.musicPath, { force: true });
+    res.json(updated);
+  } catch (error) { next(error); }
+});
+
+/** Quita la pista musical sin modificar guion, voces ni escenas. */
+app.delete('/api/stories/:id/music', async (req, res, next) => {
+  try {
+    const story = await store.get(req.params.id);
+    if (!story) throw new NotFoundError('Historia no encontrada.');
+    const updated = await store.mutate(req.params.id, (draft) => {
+      delete draft.musicPath;
+      delete draft.videoPath;
+    });
+    if (story.musicPath) await rm(story.musicPath, { force: true });
+    res.json(updated);
+  } catch (error) { next(error); }
+});
+
+/** Reemplaza la imagen activa de una escena con un archivo propio. */
+app.put('/api/stories/:id/scenes/:sceneId/image', express.raw({ type: 'image/*', limit: '15mb' }), async (req, res, next) => {
+  try {
+    const story = await store.get(req.params.id);
+    if (!story) throw new NotFoundError('Historia no encontrada.');
+    const scene = story.scenes.find((item) => item.id === req.params.sceneId);
+    if (!scene) throw new NotFoundError('Plano no encontrado.');
+    const extensions: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp' };
+    const contentType = req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() ?? '';
+    const extension = extensions[contentType];
+    if (!extension) throw new ValidationError('La imagen debe ser PNG, JPG o WebP.');
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new ValidationError('Selecciona una imagen.');
+
+    const imagePath = path.join(STORAGE_DIR, story.id, 'scenes', `${scene.id}-upload-${Date.now()}${extension}`);
+    await mkdir(path.dirname(imagePath), { recursive: true });
+    await writeFile(imagePath, req.body);
+    const updated = await store.mutate(story.id, (draft) => {
+      const target = draft.scenes.find((item) => item.id === req.params.sceneId);
+      if (!target) throw new NotFoundError('Plano no encontrado.');
+      target.variants.push(imagePath);
+      target.activeVariant = target.variants.length - 1;
+      target.attempts++;
+      target.status = 'generated';
+      delete draft.videoPath;
+    });
+    res.json(updated);
   } catch (error) { next(error); }
 });
 
@@ -391,7 +487,6 @@ app.post('/api/stories/:id/compose', async (req, res, next) => {
  */
 app.post('/api/stories/:id/scenes/:sceneId/regenerate', async (req, res, next) => {
   try {
-    if (!GEMINI_API_KEY) throw new ValidationError('Falta GEMINI_API_KEY en el servidor.');
     const input = regenerateSchema.parse(req.body ?? {});
 
     const story = await store.get(req.params.id);
@@ -407,6 +502,7 @@ app.post('/api/stories/:id/scenes/:sceneId/regenerate', async (req, res, next) =
           imageSeed: input.imageSeed ?? Date.now() % 100_000,
           regenerateVoice: input.regenerateVoice,
         });
+        delete draft.videoPath;
       });
       return updated.id;
     });
@@ -421,6 +517,7 @@ app.post('/api/stories/:id/scenes/reorder', async (req, res, next) => {
     const input = reorderSchema.parse(req.body);
     const updated = await store.mutate(req.params.id, (story) => {
       reorderScenes(story, input.sceneIds);
+      delete story.videoPath;
     });
     res.json(updated);
   } catch (error) { next(error); }
@@ -431,6 +528,7 @@ app.post('/api/stories/:id/scenes/:sceneId/duplicate', async (req, res, next) =>
   try {
     const updated = await store.mutate(req.params.id, (story) => {
       duplicateScene(story, req.params.sceneId);
+      delete story.videoPath;
     });
     res.json(updated);
   } catch (error) { next(error); }
@@ -440,6 +538,7 @@ app.delete('/api/stories/:id/scenes/:sceneId', async (req, res, next) => {
   try {
     const updated = await store.mutate(req.params.id, (story) => {
       deleteScene(story, req.params.sceneId);
+      delete story.videoPath;
     });
     res.json(updated);
   } catch (error) { next(error); }

@@ -61,7 +61,7 @@ const FAKE_SCRIPT = JSON.stringify({
 });
 
 /** Dobles de los proveedores. Cuentan las llamadas para detectar bucles. */
-function makeDeps(storageDir) {
+function makeDeps(storageDir, { references = true } = {}) {
   const calls = { llm: 0, image: 0, tts: 0 };
   const palette = ['crimson', 'indigo', 'darkgreen', 'orange'];
   let frameIndex = 0;
@@ -73,6 +73,11 @@ function makeDeps(storageDir) {
         async complete() { calls.llm++; return FAKE_SCRIPT; },
       },
       image: {
+        // Los proveedores que ignoran referencias visuales (Pollinations,
+        // ComfyUI) se saltan las fichas de personaje: es una llamada menos por
+        // personaje y no cambia el resultado.
+        supportsReferenceImages: references,
+        recommendedConcurrency: 1,
         async generate() {
           calls.image++;
           return { base64: fakeFrame(palette[frameIndex++ % palette.length], 'f'), mimeType: 'image/png' };
@@ -109,7 +114,6 @@ test('pipeline completo produce un MP4 9:16 con la duracion esperada', async () 
   assert.equal(calls.llm, 1);
   assert.equal(calls.image, 2 + 4);
   assert.equal(calls.tts, 4);
-
   assert.equal(story.scenes.length, 4);
   assert.equal(story.characters.length, 2);
   assert.ok(story.scenes.every((s) => s.status === 'generated'), 'todos los planos quedan en generated');
@@ -125,6 +129,27 @@ test('pipeline completo produce un MP4 9:16 con la duracion esperada', async () 
   assert.ok(existsSync(outputPath), 'se genera el MP4');
   const bytes = readFileSync(outputPath).length;
   assert.ok(bytes > 5000, `el MP4 tiene tamano razonable (${bytes} bytes)`);
+});
+
+test('un proveedor sin referencias se ahorra las fichas de personaje', async () => {
+  // Pollinations y ComfyUI no aceptan imagenes de referencia, asi que generar
+  // una hoja por personaje es gastar cuota para tirarla. El pipeline tiene que
+  // detectedlo y saltarselas, pero sin dejar ningun plano sin imagen.
+  const storageDir = mkdtempSync(path.join(tmpdir(), 'frutia-noref-'));
+  const { deps, calls } = makeDeps(storageDir, { references: false });
+
+  const story = await runDraftPipeline({ ...deps }, { topic: 'prueba', sceneCount: 4 });
+
+  assert.equal(calls.image, 4, 'solo los cuatro planos, sin fichas de personaje');
+  assert.equal(story.scenes.length, 4);
+  assert.ok(
+    story.scenes.every((s) => existsSync(s.variants[0] ?? '')),
+    'saltar las fichas no puede dejar planos sin imagen',
+  );
+  assert.ok(
+    story.scenes.every((s) => existsSync(s.audioPath)),
+    'y todos siguen con su audio',
+  );
 });
 
 test('composeFinal respeta la curacion y solo usa planos aprobados', async () => {

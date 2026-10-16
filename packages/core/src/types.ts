@@ -110,6 +110,12 @@ export interface Story {
   visualStyle: string;
   /** Tono de la narracion: "melodramatico", "comedia negra", "suspenso". */
   tone: string;
+  /** Idioma elegido para el guion y la narración. */
+  locale?: string;
+  /** Pista musical subida por el usuario para mezclarla bajo las voces. */
+  musicPath?: string;
+  /** MP4 local de vista previa o exportación final, si ya se renderizó. */
+  videoPath?: string;
   createdAt: string;
   updatedAt: string;
 }

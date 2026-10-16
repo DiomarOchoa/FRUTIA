@@ -1,10 +1,9 @@
 /**
  * Proveedor de voz alternativo: Pollinations.ai.
  *
- * El mismo motivo que el de imagenes. El free tier de Google para texto a voz
- * se agota con facilidad y devuelve `429` aunque la clave sea valida; cuando
- * eso ocurre no se pierde el trabajo ya generado, se cae a este proveedor, que
- * usa la misma clave y devuelve MP3 directamente.
+ * Google puede agotar su cuota de texto a voz. El respaldo Pollinations usa
+ * la clave de servidor y saldo Pollen; si falla, la cascada continúa con Edge
+ * y Piper locales.
  *
  * Ventaja sobre la voz de Google: el audio llega en MP3, no en PCM crudo, asi
  * que no hay que envolverlo en WAV a mano.
@@ -60,15 +59,18 @@ export class PollinationsTtsProvider {
     if (gap > 0) await new Promise((r) => setTimeout(r, gap));
     this.lastFreeAt = Date.now();
 
-    // Sin parametro `model`: el endpoint de audio elige su propio motor y
-    //Names uno invalido responde 400.
-    const url = `${BASE}/${encodeURIComponent(text)}?voice=${this.voice}&key=${this.token}`;
+    // La clave va en Authorization; nunca se expone en URL, historial o logs.
+    const params = new URLSearchParams({ voice: this.voice });
+    const url = `${BASE}/${encodeURIComponent(text)}?${params}`;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${this.token}` },
+        signal: controller.signal,
+      });
       if (!res.ok) {
         const detail = await res.text().catch(() => '');
         throw new Error(`Voz ${res.status}: ${detail.slice(0, 200)}`);

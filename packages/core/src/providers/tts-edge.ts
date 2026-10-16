@@ -52,6 +52,7 @@ export type EdgeVoice = (typeof EDGE_VOICES)[keyof typeof EDGE_VOICES];
 export class EdgeTtsProvider {
   private readonly voice: EdgeVoice;
   private readonly rate: string;
+  private static voicesPromise: ReturnType<typeof getVoices> | undefined;
 
   constructor(opts: EdgeTtsOptions = {}) {
     const requested = (opts.voice ?? process.env.FRUTIA_EDGE_VOICE) as EdgeVoice | undefined;
@@ -61,10 +62,11 @@ export class EdgeTtsProvider {
     this.rate = opts.rate ?? '+8%';
   }
 
-  async speak(text: string): Promise<{ base64: string; mimeType: string }> {
+  async speak(text: string, locale = 'es-419'): Promise<{ base64: string; mimeType: string }> {
     if (!text.trim()) throw new Error('Edge TTS: texto vacio.');
 
-    const audio = await tts(text, { voice: this.voice, rate: this.rate });
+    const voice = await this.voiceForLocale(locale);
+    const audio = await tts(text, { voice, rate: this.rate });
     if (!audio || audio.length === 0) {
       throw new Error('Edge TTS devolvio audio vacio.');
     }
@@ -78,5 +80,30 @@ export class EdgeTtsProvider {
   static async listVoices(locale = 'es'): Promise<string[]> {
     const todas = await getVoices();
     return todas.filter((v) => v.ShortName.startsWith(locale)).map((v) => v.ShortName);
+  }
+
+  private async voiceForLocale(locale: string): Promise<string> {
+    const normalized = locale.toLowerCase();
+    // Edge mantiene etiquetas por país: español latinoamericano apunta a
+    // Colombia y las selecciones explícitas conservan su variante regional.
+    const prefix = normalized.startsWith('es-419') ? 'es-' : `${normalized}-`;
+    if (normalized.startsWith('es-') && !normalized.startsWith('es-419')) return this.voice;
+
+    try {
+      EdgeTtsProvider.voicesPromise ??= getVoices();
+      const voices = await EdgeTtsProvider.voicesPromise;
+      const choices = voices.filter((voice) => voice.ShortName.toLowerCase().startsWith(prefix));
+      if (!choices.length) return this.voice;
+
+      const preferred = normalized.startsWith('es-419') ? 'es-CO-AndreaNeural'
+        : normalized.startsWith('pt-br') ? 'pt-BR-FranciscaNeural'
+          : normalized.startsWith('en-us') ? 'en-US-AriaNeural' : undefined;
+      return choices.find((voice) => voice.ShortName === preferred)?.ShortName
+        ?? choices.find((voice) => voice.ShortName.endsWith('Neural'))?.ShortName
+        ?? choices.at(0)?.ShortName
+        ?? this.voice;
+    } catch {
+      return this.voice;
+    }
   }
 }

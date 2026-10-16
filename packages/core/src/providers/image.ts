@@ -1,16 +1,16 @@
 /**
  * Proveedor de imagenes con cascada entre proveedores.
  *
- * El free tier de Google para imagenes es el punto fragil del modo $0:
- *dependiendo del estado de la cuenta, `gemini-*-image` responde `429` con cuota
- * cero aunque la clave sea valida. Cuando eso pasa no se pierde el trabajo
- * entero; se cae a Pollinations, que no necesita clave ni tarjeta.
+ * El free tier de Google para imagenes es el punto fragil del modo local.
+ * Cuando agota cuota, el modo automatico cae a Pollinations, que requiere una
+ * clave de servidor y saldo de Pollen en la cuenta.
  *
  * Solo se degrada por falta de cuota. Un error de contenido o de red se
  * propaga: cambiar de proveedor a ciegas no lo arregla y gasta el doble.
  */
 
 import { PollinationsImageProvider } from './image-pollinations.js';
+import { HuggingFaceImageProvider } from './image-huggingface.js';
 import { ComfyUiImageProvider } from './comfyui.js';
 import { isModelRetired, ModelRetiredError, modelCandidates, withModelFallback } from './models.js';
 import type { GenerateImageInput, GenerateImageOutput } from './image-types.js';
@@ -23,20 +23,20 @@ export interface GeminiOptions {
   timeoutMs?: number;
 }
 
+export type ImageProviderPreference = 'auto' | 'gemini' | 'pollinations' | 'comfyui' | 'huggingface';
+
 export interface ResilientImageOptions {
   apiKey: string;
   /**
    * Proveedor preferido: "auto" (por defecto) cae a Pollinations si Google
-   * agota la cuota, "gemini" falla y "pollinations" usa solo el gratuito.
+   * agota cuota, "gemini" falla y "pollinations" usa solo Pollinations.
    */
-  prefer?: 'auto' | 'gemini' | 'pollinations' | 'comfyui';
+  prefer?: ImageProviderPreference;
   pollinationsModel?: string;
   /**
    * Ajustes de Pollinations: sobre todo `minIntervalSec`.
    *
-   * Existe para poder bajar el ritmo en pruebas y para que un usuario con la
-   * clave de pago, que no tiene limite, pueda subirlo. Sin esto, el intervalo
-   * anonimo de 20 segundos queda fijo para todo el mundo.
+   * Existe para poder ajustar el ritmo en pruebas y evitar rafagas.
    */
   pollinations?: { minIntervalSec?: number; model?: string; token?: string };
 }
@@ -138,7 +138,8 @@ export class ImageProvider {
   private readonly gemini: GeminiImageProvider | undefined;
   private readonly pollinations: PollinationsImageProvider;
   private readonly comfyui: ComfyUiImageProvider | undefined;
-  private readonly prefer: 'auto' | 'gemini' | 'pollinations' | 'comfyui';
+  private readonly huggingface: HuggingFaceImageProvider | undefined;
+  private readonly prefer: ImageProviderPreference;
 
   /**
    * Momento en que Google vuelve a servir, si se pudo calcular.
@@ -152,7 +153,7 @@ export class ImageProvider {
    * podían salir, cada una con su latencia.
    *
    * Guardando el momento del reinicio, la app deja de preguntar a Google hasta
-   * que la cuota vuelva de verdad, y va directa a Pollinations.
+   * que la cuota vuelva de verdad y pasa a los respaldos configurados.
    */
   private geminiMuertoHasta = 0;
   private motivoGemini = '';
@@ -160,14 +161,32 @@ export class ImageProvider {
   /** Modelo realmente usado en la ultima llamada. Se muestra en la UI. */
   lastBackend = 'gemini';
 
+  /** Pollinations solo acepta texto; no se deben generar referencias inútiles. */
+  get supportsReferenceImages(): boolean {
+    // ComfyUI tampoco consume referencias visuales en este workflow. Pedir
+    // hojas de personaje aquí añadía una generación local cara que se tiraba.
+    return this.prefer !== 'pollinations' && this.prefer !== 'huggingface' && this.prefer !== 'comfyui';
+  }
+
+  /** Con token Pollinations admite varias generaciones simultáneas. */
+  get recommendedConcurrency(): number {
+    if (this.prefer === 'huggingface') return 2;
+    return this.prefer === 'pollinations' && this.pollinations.hasToken ? 3 : 1;
+  }
+
   constructor(opts: ResilientImageOptions) {
     this.prefer = opts.prefer ?? 'auto';
     this.comfyui = opts.prefer === 'comfyui' ? new ComfyUiImageProvider() : undefined;
-    // En modo solo-Pollinations no se necesita clave de Google: exigirla
-    // impedía usar el proveedor gratuito sin cuenta de Gemini.
-    this.gemini = opts.prefer === 'pollinations' || opts.prefer === 'comfyui'
+    const hfToken = (process.env.HF_TOKEN || process.env.HUGGINGFACE_API_KEY || '').replace(/^\uFEFF/, '').trim();
+    this.huggingface = opts.prefer === 'huggingface' || (opts.prefer === 'auto' && Boolean(hfToken))
+      ? new HuggingFaceImageProvider({ token: hfToken || undefined })
+      : undefined;
+    // Auto también funciona si Google no está configurado: usa HF o
+    // Pollinations cuando esas credenciales sí están disponibles.
+    this.gemini = opts.prefer === 'pollinations' || opts.prefer === 'comfyui' || !opts.apiKey
       ? undefined
       : new GeminiImageProvider({ apiKey: opts.apiKey });
+    if (opts.prefer === 'gemini' && !this.gemini) throw new Error('Imagen: falta GEMINI_API_KEY.');
     this.pollinations = new PollinationsImageProvider({
       model: opts.pollinations?.model ?? opts.pollinationsModel,
       minIntervalSec: opts.pollinations?.minIntervalSec,
@@ -204,8 +223,8 @@ export class ImageProvider {
       : Number.POSITIVE_INFINITY;
 
     this.motivoGemini = segundos
-      ? `Google sin cuota de imagenes; se reintenta en ${Math.round(segundos / 3600)} h. Las imagenes salen por Pollinations.`
-      : 'Google quedo sin cuota de imagenes en esta sesion. Las imagenes salen por Pollinations.';
+      ? `Google sin cuota de imágenes; se reintenta en ${Math.round(segundos / 3600)} h. Frutia probará los respaldos configurados.`
+      : 'Google quedó sin cuota de imágenes en esta sesión. Frutia probará los respaldos configurados.';
   }
 
   /** Convierte "14h31m13.5s" a segundos. */
@@ -224,6 +243,11 @@ export class ImageProvider {
   }
 
   async generate(input: GenerateImageInput): Promise<GenerateImageOutput> {
+    if (this.prefer === 'huggingface') {
+      this.lastBackend = 'huggingface';
+      return this.huggingface!.generate(input);
+    }
+
     if (this.prefer === 'comfyui') {
       this.lastBackend = 'comfyui';
       return this.comfyui!.generate(input);
@@ -234,35 +258,57 @@ export class ImageProvider {
       return this.pollinations.generate(input);
     }
 
-    // Ya se sabe que Google no tiene cuota: no se vuelve a preguntar. Es la
-    // diferencia entre arrancar en un segundo y perder tres llamadas por toma.
-    if (!this.geminiDisponible()) {
-      this.lastBackend = 'pollinations';
-      return this.pollinations.generate(input);
+    if (this.prefer === 'gemini') {
+      this.lastBackend = 'gemini';
+      return this.gemini!.generate(input);
     }
 
+    return this.generateAutomatic(input);
+  }
+
+  /** Recorre los motores configurados sin pedir al usuario que los cambie. */
+  private async generateAutomatic(input: GenerateImageInput): Promise<GenerateImageOutput> {
+    if (this.gemini && this.geminiDisponible()) {
+      try {
+        const result = await this.gemini.generate(input);
+        this.lastBackend = 'gemini';
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const quotaGone = error instanceof QuotaExhaustedError || /429|quota/i.test(message);
+        if (!quotaGone) throw error;
+        this.registrarMuerteGemini(message);
+      }
+    }
+
+    const fallos: string[] = [];
+    if (this.huggingface) {
+      try {
+        const result = await this.huggingface.generate(input);
+        this.lastBackend = 'huggingface';
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        fallos.push(`Hugging Face: ${message}`);
+        // No reintentar errores de prompt: solo pasar a otro backend cuando
+        // parece ser una caída, cuota, autenticación o modelo no disponible.
+        if (!/401|402|403|404|408|429|5\d\d|timeout|timed out|temporar|unavailable|provider/i.test(message)) {
+          throw error;
+        }
+      }
+    }
+
+    this.lastBackend = 'pollinations';
     try {
-      const result = await this.gemini!.generate(input);
-      this.lastBackend = 'gemini';
-      return result;
-    } catch (error) {
-      if (this.prefer === 'gemini' || !this.gemini) throw error;
-
-      // Solo se degrada por cuota. Ante un 400 de contenido o un fallo de red,
-      // el otro proveedor tampoco acertaria y solo duplicaria el gasto.
-      const mensaje = error instanceof Error ? error.message : String(error);
-      const quotaGone = error instanceof QuotaExhaustedError
-        || /429|quota/i.test(mensaje);
-
-      if (!quotaGone) throw error;
-
-      this.registrarMuerteGemini(mensaje);
-      this.lastBackend = 'pollinations';
       const result = await this.pollinations.generate(input);
       Object.defineProperty(this, 'degradedReason', {
-        value: this.motivoGemini, writable: true, configurable: true,
+        value: this.motivoGemini || fallos.join(' · '), writable: true, configurable: true,
       });
       return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (fallos.length) throw new Error(`${fallos.join(' · ')} · ${message}`);
+      throw error;
     }
   }
 }

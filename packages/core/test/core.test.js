@@ -49,7 +49,11 @@ test('buildAss emite un header valido y un evento por palabra', () => {
   assert.match(ass, /\[Events\]/);
   assert.match(ass, /PlayResX: 1080/);
   assert.match(ass, /PlayResY: 1920/);
-  assert.match(ass, /^Style: Pop,Anton,78,/m);
+  // La fuente tiene que ser una que exista en el equipo del usuario. Se
+  // probó Anton y es la que pide el estilo viral, pero no viene instalada en
+  // Windows: ffmpeg la sustituye por la predeterminada y los subtitulos salen
+  // con otra tipografia sin avisar. Arial esta siempre.
+  assert.match(ass, /^Style: Pop,Arial,6\d,/m);
 
   const dialogues = ass.split('\n').filter((l) => l.startsWith('Dialogue:'));
   assert.equal(dialogues.length, cues[0].words.length);
@@ -141,7 +145,9 @@ test('parseStoryResponse acepta un estilo valido Proposed por el modelo', () => 
   const raw = JSON.stringify({ visualStyleId: 'claymation', characters: [], scenes: [] });
   const story = parseStoryResponse(raw, 'x', 'pixelart');
   assert.equal(story.visualStyleId, 'claymation');
-  assert.match(story.visualStyle, /arcilla/);
+  // Los prompts de imagen van en ingles a proposito: Flux, SDXL y los demas
+  // responden mucho mejor en ingles que con "arcilla" o "plastilina".
+  assert.match(story.visualStyle, /clay/i);
 });
 
 test('parseStoryResponse cae al estilo por defecto si no hay ninguno', () => {

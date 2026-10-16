@@ -1,8 +1,8 @@
 # 🍓 Frutia — Generador de Frutinovelas con IA
 
-SaaS web para generar minidramas narrativos verticales (9:16) listos para TikTok,
-Reels y Shorts, con personajes consistentes, voz en español y subtítulos
-estilizados. Flujo **semi-automático con curaduría humana**.
+SaaS web para convertir un guion pegado en un minidrama vertical (9:16), con
+personajes consistentes, imágenes, voz, subtítulos y vista previa MP4. El usuario
+puede elegir idioma, motor de imagen, estilo y otros ajustes antes de generar.
 
 ---
 
@@ -40,7 +40,8 @@ frutia/
 │       ├── pipeline.ts            # Orquestación por etapas
 │       ├── providers/
 │       │   ├── llm.ts             # Guion + hoja de personaje
-│       │   ├── image.ts           # Imágenes de personaje y planos
+│       │   ├── image.ts           # Enrutamiento entre motores de imagen
+│       │   ├── image-huggingface.ts # Hugging Face Inference Providers
 │       │   └── tts.ts             # Voz en español
 │       └── render/
 │           ├── ffmpeg.ts          # Composición 9:16 + Ken Burns
@@ -73,25 +74,26 @@ frutia/
 ## Pipeline
 
 ```
-Tema
- └─▶ Guion (LLM)              arco de 8 planos: hook → … → cliffhanger
-     └─▶ Hoja de personaje     3-5 personajes con descripción visual fija
-         └─▶ Imagen por plano  reinyectando la ficha del personaje
-             └─▶ Voz (TTS ES)  un clip de audio por plano
-                 └─▶ Subtítulos alineados, resaltado palabra a palabra
-                     └─▶ Render — Ken Burns + concat + quemado de subtítulos
-                         └─▶ EXPORTAR 1080x1920
+Guion pegado (o una idea)
+ └─▶ Adaptación a escenas (LLM) · gancho → conflicto → cliffhanger
+     ├─▶ Fichas de personajes · 3–5 diseños visuales consistentes
+     ├─▶ Imágenes · referencias de personaje reinyectadas por plano
+     ├─▶ Voz en el idioma elegido y subtítulos palabra por palabra
+     └─▶ Vista previa MP4 automática, o revisión antes del render
 ```
 
-El pipeline **se detiene antes de componer**. El usuario revisa y aprueba cada
-plano; solo entonces se renderiza. En producción, el servidor fuerza esa barrera
-(`NODE_ENV=production`).
+El flujo principal empieza pegando un guion de hasta 16.000 caracteres. Frutia
+lo divide en escenas y prepara el reparto, las imágenes, las voces y los
+subtítulos. Por defecto también renderiza una vista previa local. Se puede
+desactivar el render automático y hacerlo después de revisar los planos. La app
+nunca publica en redes; para la exportación final en producción se requiere
+aprobación de los planos (`NODE_ENV=production`).
 
 ### Trabajo por plano
 
-Rehacer una historia entera cuesta unas 13 llamadas. Regenerar **un solo plano**
-cuesta una, y es la operación que más se repite: una toma queda mal y se vuelve a
-tirar solo esa imagen. El plano vuelve a estado `generated` y pierde la
+Rehacer una historia entera vuelve a crear cada escena. Regenerar **un solo plano**
+repite solo esa imagen, y es la operación que más se repite: una toma queda mal y
+se vuelve a generar sin tocar lo demás. El plano vuelve a estado `generated` y pierde la
 aprobación anterior, porque si la imagen cambió la aprobación ya no significa
 nada.
 
@@ -111,20 +113,22 @@ veces pierde a su audiencia aunque cambien los personajes. Al elegir una propues
 se guarda su índice y deja de ofrecerse; el historial vive en
 `storage/ideas-usadas.json`.
 
-### Proveedores con cascada
+### Perfiles de generación
 
-Cada motor intenta Google primero y cae a Pollinations si la cuota se agota:
+La instalación predeterminada usa motores locales y evita llamadas ocultas o
+compras de créditos:
 
-| Motor | Principal | Respaldo |
+| Etapa | Motor predeterminado | Alternativa |
 |---|---|---|
-| Guion | `gemini-3.8-flash` | — (sin alternativa gratuita igual de buena) |
-| Imagen | `gemini-3.1-flash-image` | Pollinations `flux` |
-| Voz | `gemini-3.1-flash-tts-preview` | Pollinations |
+| Guion y escenas | Ollama `qwen2.5:3b` | Google Gemini con clave configurada |
+| Imágenes | ComfyUI y Stable Diffusion 1.5 | Hugging Face o Google/Pollinations al cambiar el proveedor |
+| Voces | Piper | Voces en la nube si se cambia el proveedor |
+| Montaje, subtítulos y MP4 | FFmpeg local | — |
 
-Los nombres de modelo **no están fijos en el código**: hay una lista de
-candidatos y, si uno devuelve 404 por retirada, se prueba el siguiente. Google
-retiró `gemini-2.5-flash` para cuentas nuevas a mitad de 2026 y habría tumbado el
-proyecto entero si el nombre hubiera estado escrito a fuego.
+En Opciones de producción se puede seleccionar Hugging Face
+`black-forest-labs/FLUX.1-schnell`. Necesita `HF_TOKEN` y puede consumir
+créditos. ComfyUI en CPU tarda más que una GPU; el pipeline evita crear retratos
+de referencia que ese workflow local no puede usar.
 
 ---
 
@@ -140,8 +144,24 @@ npm install
 cp .env.example .env      # en Windows: copy .env.example .env
 ```
 
-Edita `.env` y pega tu clave de **Google AI Studio** (gratis):
-https://aistudio.google.com/apikey
+El `.env.example` configura el modo local: Ollama (`qwen2.5:3b`), ComfyUI
+(checkpoint Stable Diffusion 1.5) y Piper. Para usarlo, instala o abre esos
+tres motores en la máquina. Si se ejecutan solo con CPU, la generación de
+imágenes puede tardar varios minutos.
+
+Para usar motores remotos, cambia los proveedores en `.env` y configura las
+claves correspondientes. Google AI Studio puede dar cuota gratuita; Hugging
+Face y Pollinations pueden consumir créditos o saldo. Frutia no contrata
+servicios ni publica el resultado automáticamente.
+
+Si quieres usar Pollinations como respaldo, añade una clave secreta en
+`POLLINATIONS_API_KEY`. Sus imágenes consumen saldo Pollen; Frutia ya no
+reintenta respuestas 402 porque no se resuelven esperando.
+
+Para seleccionar Hugging Face en las opciones, crea un token con permiso
+**Make calls to Inference Providers** y guárdalo en `.env` como `HF_TOKEN`.
+La inferencia puede requerir créditos o pago según la cuenta/modelo; consulta
+el [precio y consumo](https://huggingface.co/docs/inference-providers/pricing).
 
 ```bash
 # 3. Compilar el núcleo
@@ -155,9 +175,9 @@ npm run test:api  # 25 comprobaciones del contrato HTTP (levanta el servidor)
 npm run dev
 ```
 
-Abre <http://localhost:5173>, ve a **Nueva**, escribe un tema y genera tu
-primera frutinovela. Tarda 3–8 minutos: son 4 a 60 llamadas a la API según
-cuántas variantes pidas por plano.
+Abre <http://localhost:5173>, ve a **Nueva**, pega un guion y genera tu
+frutinovela. Frutia crea las escenas, las voces, los subtítulos y, por defecto,
+el MP4. En el editor puedes subir imágenes propias y una pista musical local.
 
 Sin clave puedes ver el pipeline entero funcionando con contenido sintético:
 

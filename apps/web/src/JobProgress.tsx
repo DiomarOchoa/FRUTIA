@@ -76,6 +76,7 @@ export function JobProgress({
   }
 
   const percent = overallPercent(job);
+  const activeStage = job.progress.find((stage) => stage.status === 'running');
 
   return (
     <div className="card-inset stack" style={{ gap: 12 }}>
@@ -98,6 +99,8 @@ export function JobProgress({
 
       <div className="bar"><div className="bar-fill" style={{ width: `${percent}%` }} /></div>
 
+      {activeStage?.message && <p className="progress-note">{activeStage.message}</p>}
+
       {job.progress.length > 0 && (
         <div className="row wrap" style={{ gap: 6 }}>
           {job.progress.map((s: StageProgress) => (
@@ -110,7 +113,7 @@ export function JobProgress({
       )}
 
       <p className="tiny faint">
-        Esto puede tardar varios minutos: cada imagen y cada voz son llamadas a una API externa.
+        Frutia trabaja en segundo plano. En modo local, el tiempo de las imágenes depende de la velocidad del equipo.
       </p>
     </div>
   );
